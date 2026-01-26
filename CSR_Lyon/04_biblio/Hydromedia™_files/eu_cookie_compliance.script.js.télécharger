@@ -1,0 +1,1 @@
+window.euCookieComplianceLoadScripts = function(category) {var scriptTag = document.createElement("script");scriptTag.src = "\/sites\/france\/files\/google_tag\/gtm_country\/google_tag.script.js";document.body.appendChild(scriptTag);}
