@@ -1,617 +1,507 @@
 # -*- coding: utf-8 -*-
 """
-Découpe d'évènements pluie–ruissellement pour le parking CSR (OTHU)
+ANALYSE VITESSES D'INFILTRATION PAR EVENEMENT (CSR Lyon)
+=======================================================
 
-Objectif : ne garder que des évènements "propres" pour modélisation :
-- évènement commence avec Q_ruiss ~ 0 ET Q_inf ~ 0 (et pluie ~0) sur une durée minimale
-- évènement finit quand Q_inf revient à ~0 (et Q_ruiss ~0) durablement
-- rejeter les évènements qui sont manifestement la fin d'un évènement précédent
+But:
+- Partir des évènements déjà découpés (all_events1) + méta hr_hp_events.csv
+- Construire v_inf(t) = Q_inf(t) / A en mm/h (champ temporel par évènement)
+- Produire :
+  (1) Excel synthèse (stats par évènement)
+  (2) Plots globaux (distribution, relations avec hp/hi/durée)
+  (3) Optionnel: figures v_inf(t) par évènement
 
-ENTRÉE :
-  CSR_Lyon/02_Data/Donnees_serie_complete_2022-2024_corrigee_AS.csv (sep=';')
-  Colonnes attendues :
-      Date ; Hauteur_de_pluie_mm ; Q_inf_LH ; Q_ruiss_LH
+Entrées:
+- CSR_Lyon/02_Data/all_events1/hr_hp_events.csv
+- CSR_Lyon/02_Data/all_events1/YYYY/event_YYYY_NNN.csv
 
-SORTIES :
-  CSR_Lyon/02_Data/all_events1/YYYY/event_YYYY_NNN.csv
-      date ; P_mm ; Q_inf_LH ; Q_ruiss_LH
-  CSR_Lyon/03_Plots/Etude_hydrologique/YYYY/event_YYYY_NNN.png
-  CSR_Lyon/02_Data/all_events1/hr_hp_events.csv
-  + plots de synthèse
+Sorties:
+- CSR_Lyon/03_Plots/Etude_hydrologique/INFILTRATION_VELOCITY/
+    infiltration_velocity_events.xlsx
+    *.png (synthèse)
+    EVENTS/*.png (optionnel)
+
+Notes importantes (sans blabla):
+- v_inf(t) ici = flux moyen au pas de temps sur la surface A_SITE_M2, en mm/h.
+- Si Q_inf_LH contient du bruit et des valeurs négatives: on clippe à 0 par défaut.
+  Tu peux désactiver si tu veux diagnostiquer les artefacts capteur.
 """
 
 from pathlib import Path
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ======================================================================
-# PARAMÈTRES
-# ======================================================================
 
-BASE_DIR = Path(__file__).resolve().parents[1]  # -> CSR_Lyon/
+# =========================================================
+# CONFIG
+# =========================================================
+def get_config():
+    try:
+        root = Path(__file__).resolve().parents[1]  # -> CSR_Lyon/
+    except NameError:
+        root = Path.cwd()
 
-DATA_FILE = BASE_DIR / "02_Data" / "Donnees_serie_complete_2022-2024_corrigee_AS.csv"
-OUT_EVENTS_DIR = BASE_DIR / "02_Data" / "all_events1"
-OUT_PLOTS_DIR = BASE_DIR / "03_Plots" / "Etude_hydrologique"
+    cfg = dict(
+        ROOT=root,
+        A_SITE_M2=94.0,
 
-A_SITE_M2 = 94.0
+        META_EVENTS=root / "02_Data" / "all_events1" / "hr_hp_events.csv",
+        EVENTS_ROOT=root / "02_Data" / "all_events1",
 
-# --- Seuils pluie / débits
-P_THR_MM = 0.0               # pluie considérée nulle (mets 0.05 ou 0.1 si bruit)
-Q_THR_RUISS_LH = 2.0         # "wet noyau" si Qruiss dépasse ça
+        OUT_DIR=root / "03_Plots" / "Etude_hydrologique" / "INFILTRATION_VELOCITY",
+        OUT_XLSX_NAME="infiltration_velocity_events.xlsx",
 
-# --- Conditions ZERO pour start/end propre (à régler selon le bruit capteur)
-Q0_RUISS_LH = 0.8            # "débit nul" ruissellement
-Q0_INF_LH   = 0.8            # "débit nul" infiltration (drain)
+        # Nettoyage capteur
+        CLIP_QINF_NEGATIVE=True,    # True = max(Qinf,0). False = garder le signe.
+        QINF_ZERO_THR_LH=0.0,       # pour définir "temps actif" (0.0 ou un petit seuil)
 
-START_ZERO_MIN = 60.0        # avant le noyau, exige START_ZERO_MIN minutes de (P~0,Qruiss~0,Qinf~0)
-END_ZERO_MIN   = 60.0        # pour finir l'event, exige END_ZERO_MIN minutes de (P~0,Qruiss~0,Qinf~0)
+        # Courbes par évènement (optionnel)
+        MAKE_EVENT_PNG=True,
+        EVENT_PLOT_MODE="topN",     # "all" | "topN"
+        TOP_N=30,
+        TOP_BY="v_inf_p95_mm_h",    # colonne de tri pour topN
 
-# --- Détection du noyau (comme avant)
-END_DRY_MINUTES = 60.0       # fin noyau : pluie nulle + Qruiss faible durablement
-Q_END_RUISS_LH = 1.0
+        # Plots synthèse
+        MAKE_SUMMARY_PNG=True,
+        DPI=170,
+    )
+    return cfg
 
-DRY_MIN_HOURS = 1.0          # séparation d'évènements
 
-# --- Filtres soft
-MIN_CORE_DURATION_MIN = 6.0
-MIN_HP_MM = 0.05
-MIN_QMAX_RUISS_LH = 3.0
+# =========================================================
+# Utils
+# =========================================================
+def infer_dt_seconds(time_index: pd.DatetimeIndex) -> float:
+    dt_s = float(pd.Series(time_index).diff().dropna().dt.total_seconds().median())
+    if not np.isfinite(dt_s) or dt_s <= 0:
+        raise RuntimeError("Impossible d'inférer dt (dates non régulières / invalides).")
+    return dt_s
 
-# --- Plots
-MAKE_PLOTS = True
-PLOT_DPI = 180
 
-# Optionnel : afficher un peu après la fin export (PLOT SEULEMENT)
-PLOT_POST_PAD_MIN = 120.0    # 0 si tu ne veux pas
-
-# ======================================================================
-# OUTILS
-# ======================================================================
-
-def parse_datetime_series(df: pd.DataFrame) -> pd.DataFrame:
-    if "Date" not in df.columns:
-        raise ValueError("Colonne manquante: 'Date'")
-    df["date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    if df["date"].isna().any():
-        bad = df[df["date"].isna()].head(5)
-        raise ValueError(f"Dates illisibles. Exemples:\n{bad}")
-    return df
-
-def infer_dt_seconds(dates: pd.Series) -> float:
-    dt = dates.diff().dt.total_seconds().dropna()
-    if len(dt) == 0:
-        raise ValueError("Impossible d'inférer dt (série trop courte).")
-    return float(np.median(dt))
-
-def build_is_wet(P_mm: np.ndarray, Q_ruiss_LH: np.ndarray) -> np.ndarray:
-    return (P_mm > P_THR_MM) | (Q_ruiss_LH > Q_THR_RUISS_LH)
-
-def is_end_of_core(P_mm: np.ndarray, Q_ruiss_LH: np.ndarray, i: int, dt_sec: float) -> bool:
+def parse_year_evt(row):
     """
-    Fin core = END_DRY_MINUTES consécutives avec :
-      P <= P_THR_MM ET Qruiss <= Q_END_RUISS_LH
+    Supporte:
+      - year, event_id = (2023, "event_2023_012")
+      - year, evt_num  = (2023, 12)
+      - ("2023", "12")
     """
-    n = len(P_mm)
-    need = max(int(np.ceil(END_DRY_MINUTES * 60.0 / dt_sec)), 1)
-    if i + need >= n:
-        return True
-    for j in range(i, i + need):
-        if P_mm[j] > P_THR_MM:
-            return False
-        if Q_ruiss_LH[j] > Q_END_RUISS_LH:
-            return False
-    return True
+    year_raw = row.iloc[0]
+    evt_raw = row.iloc[1]
 
-def find_core_events(P_mm: np.ndarray, Q_ruiss_LH: np.ndarray, dt_sec: float):
+    try:
+        year = int(str(year_raw).strip())
+    except Exception:
+        year = None
+
+    evt_s = str(evt_raw).strip()
+    m = re.search(r"event_(\d{4})_(\d{1,4})", evt_s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    # "YYYY ... NNN"
+    m = re.search(r"(\d{4})\D+(\d{1,4})$", evt_s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    try:
+        evt_num = int(evt_s)
+    except Exception:
+        evt_num = None
+
+    return year, evt_num
+
+
+def read_event_csv(events_root: Path, year: int, evt_num: int, sep=";"):
+    name = f"event_{year}_{evt_num:03d}"
+    csv_path = events_root / str(year) / f"{name}.csv"
+    if not csv_path.exists():
+        return None, None
+
+    df = pd.read_csv(csv_path, sep=sep)
+    if "date" not in df.columns:
+        return None, None
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    if len(df) < 2:
+        return None, None
+
+    # Colonnes attendues (ton découpage)
+    for c in ["P_mm", "Q_inf_LH", "Q_ruiss_LH"]:
+        if c not in df.columns:
+            return None, None
+
+    return name, df
+
+
+def qlh_to_vmmh(q_lh, area_m2):
     """
-    Début core = premier wet après DRY_MIN_HOURS secs
-    Fin core = is_end_of_core
+    Convertit Q (L/h) -> v (mm/h) sur la surface area_m2:
+      1 L = 0.001 m3
+      mm/h = (m3/h) / A * 1000
+          = (Q_lh*0.001)/A * 1000
+          = Q_lh / A
+    Donc: v(mm/h) = Q(L/h) / A(m2)  (simple et exact)
     """
-    n = len(P_mm)
-    if n == 0:
-        return []
+    return np.asarray(q_lh, float) / float(area_m2)
 
-    is_wet = build_is_wet(P_mm, Q_ruiss_LH)
-    events = []
-    i = 0
 
-    # skip wet au tout début
-    while i < n and is_wet[i]:
-        i += 1
+def safe_percentile(x, p):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.nan
+    return float(np.percentile(x, p))
 
-    while i < n:
-        # avance en sec
-        while i < n and not is_wet[i]:
-            i += 1
-        if i >= n:
-            break
 
-        i0 = i
-        i1 = None
-        while i < n:
-            if is_end_of_core(P_mm, Q_ruiss_LH, i, dt_sec):
-                i1 = i - 1
-                skip = max(int(np.ceil(END_DRY_MINUTES * 60.0 / dt_sec)), 1)
-                i = min(i + skip, n)
-                break
-            i += 1
+def safe_max(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    return float(np.max(x)) if len(x) else np.nan
 
-        if i1 is None:
-            i1 = n - 1
 
-        if i0 <= i1:
-            events.append((i0, i1))
+def safe_mean(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    return float(np.mean(x)) if len(x) else np.nan
 
-    return events
 
-def _need_samples(minutes: float, dt_sec: float) -> int:
-    return max(int(np.ceil(minutes * 60.0 / dt_sec)), 1)
+# =========================================================
+# Analyse par évènement
+# =========================================================
+def compute_velocity_metrics(df_evt: pd.DataFrame, A_site_m2: float,
+                             clip_qinf_negative: bool, qinf_zero_thr_lh: float):
+    t = pd.DatetimeIndex(df_evt["date"])
+    dt_s = infer_dt_seconds(t)
 
-def find_clean_start(i0_core: int, P: np.ndarray, Qr: np.ndarray, Qi: np.ndarray, dt_sec: float):
-    """
-    Exige START_ZERO_MIN minutes juste avant i0_core avec P~0 & Qr~0 & Qi~0.
-    Si ok : retourne i0_evt = i0_core - start_need
-    Sinon : None
-    """
-    need = _need_samples(START_ZERO_MIN, dt_sec)
-    i0 = i0_core - need
-    if i0 < 0:
-        return None
+    P = pd.to_numeric(df_evt["P_mm"], errors="coerce").fillna(0.0).to_numpy(float)
+    Qinf = pd.to_numeric(df_evt["Q_inf_LH"], errors="coerce").fillna(0.0).to_numpy(float)
+    Qru  = pd.to_numeric(df_evt["Q_ruiss_LH"], errors="coerce").fillna(0.0).to_numpy(float)
 
-    cond = (P[i0:i0_core] <= P_THR_MM) & (Qr[i0:i0_core] <= Q0_RUISS_LH) & (Qi[i0:i0_core] <= Q0_INF_LH)
-    if np.all(cond):
-        return i0
-    return None
+    if clip_qinf_negative:
+        Qinf = np.clip(Qinf, 0.0, None)
 
-def find_clean_end(i1_core: int, P: np.ndarray, Qr: np.ndarray, Qi: np.ndarray, dt_sec: float):
-    """
-    Cherche la première fenêtre END_ZERO_MIN minutes après i1_core
-    où P~0 & Qr~0 & Qi~0. L'event se termine à la fin de cette fenêtre.
-    Si non trouvé : None
-    """
-    n = len(P)
-    need = _need_samples(END_ZERO_MIN, dt_sec)
+    v_inf = qlh_to_vmmh(Qinf, A_site_m2)  # mm/h, à chaque pas
 
-    start = i1_core + 1
-    if start >= n:
-        return None
+    duration_h = float(len(df_evt) * dt_s / 3600.0)
+    duration_min = float(len(df_evt) * dt_s / 60.0)
 
-    for k in range(start, n - need + 1):
-        window_ok = (P[k:k+need] <= P_THR_MM) & (Qr[k:k+need] <= Q0_RUISS_LH) & (Qi[k:k+need] <= Q0_INF_LH)
-        if np.all(window_ok):
-            return k + need - 1
-    return None
+    hp_mm = float(np.sum(np.clip(P, 0.0, None)))
 
-def compute_event_metrics(df_part: pd.DataFrame, dt_sec: float, area_m2: float):
-    hp_mm = float(df_part["P_mm"].sum())
+    # volumes -> lames (comme ton code)
+    # hi_mm (mm) = integral(Qinf)/A ; ici en discret:
+    # Qinf (L/h) -> m3/s: /1000/3600 ; *dt -> m3 ; /A *1000 -> mm
+    Qinf_m3s = (Qinf / 1000.0) / 3600.0
+    Vinf_m3 = float(np.sum(Qinf_m3s) * dt_s)
+    hi_mm = 1000.0 * Vinf_m3 / A_site_m2
 
-    Qr_LH = df_part["Q_ruiss_LH"].to_numpy(dtype=float)
-    Qi_LH = df_part["Q_inf_LH"].to_numpy(dtype=float)
+    Qru_m3s = (Qru / 1000.0) / 3600.0
+    Vru_m3 = float(np.sum(np.clip(Qru_m3s, 0, None)) * dt_s)
+    hr_mm = 1000.0 * Vru_m3 / A_site_m2
 
-    Qr_m3s = (Qr_LH / 3600.0) / 1000.0
-    Qi_m3s = (Qi_LH / 3600.0) / 1000.0
+    # "activité" infiltration (temps où Qinf dépasse un seuil)
+    thr = float(qinf_zero_thr_lh)
+    active = (Qinf > thr) & np.isfinite(Qinf)
+    frac_active = float(np.mean(active)) if len(active) else np.nan
+    active_h = float(np.sum(active) * dt_s / 3600.0)
 
-    Vr_m3 = float(np.sum(Qr_m3s) * dt_sec)
-    Vi_m3 = float(np.sum(Qi_m3s) * dt_sec)
+    # timing du pic v_inf
+    if np.isfinite(v_inf).any():
+        i_peak = int(np.nanargmax(v_inf))
+        t_peak = pd.Timestamp(t[i_peak])
+        t0 = pd.Timestamp(t[0])
+        ttp_min = float((t_peak - t0).total_seconds() / 60.0)
+    else:
+        ttp_min = np.nan
 
-    hr_mm = 1000.0 * Vr_m3 / area_m2 if area_m2 > 0 else np.nan
-    hi_mm = 1000.0 * Vi_m3 / area_m2 if area_m2 > 0 else np.nan
+    # stats robustes
+    v_p50 = safe_percentile(v_inf, 50)
+    v_p75 = safe_percentile(v_inf, 75)
+    v_p90 = safe_percentile(v_inf, 90)
+    v_p95 = safe_percentile(v_inf, 95)
+    v_max = safe_max(v_inf)
+    v_mean = safe_mean(v_inf)
+
+    # moyenne conditionnelle sur périodes actives
+    v_mean_active = safe_mean(v_inf[active]) if np.any(active) else np.nan
 
     return dict(
+        dt_sec=dt_s,
+        t_start=str(pd.Timestamp(t.min())),
+        t_end=str(pd.Timestamp(t.max())),
+        duration_min=duration_min,
+        duration_h=duration_h,
+
         hp_mm=hp_mm,
-        hr_mm=hr_mm,
         hi_mm=hi_mm,
-        Vruiss_m3=Vr_m3,
-        Vinf_m3=Vi_m3,
-        Qmax_ruiss_LH=float(np.max(Qr_LH)) if len(Qr_LH) else 0.0,
-        Qmax_inf_LH=float(np.max(Qi_LH)) if len(Qi_LH) else 0.0,
-        dur_min=float(len(df_part) * dt_sec / 60.0),
-    )
+        hr_mm=hr_mm,
 
-def plot_event(df_evt: pd.DataFrame, out_png: Path, title: str, dt_sec: float, area_m2: float):
-    t = df_evt["date"]
-    P = df_evt["P_mm"].to_numpy(dtype=float)
-    Qr_LH = df_evt["Q_ruiss_LH"].to_numpy(dtype=float)
-    Qi_LH = df_evt["Q_inf_LH"].to_numpy(dtype=float)
+        Qmax_inf_LH=float(np.nanmax(Qinf)) if np.isfinite(Qinf).any() else np.nan,
+        Qmax_ruiss_LH=float(np.nanmax(Qru)) if np.isfinite(Qru).any() else np.nan,
 
-    P_cum_mm = np.cumsum(P)
+        v_inf_mean_mm_h=v_mean,
+        v_inf_mean_active_mm_h=v_mean_active,
+        v_inf_p50_mm_h=v_p50,
+        v_inf_p75_mm_h=v_p75,
+        v_inf_p90_mm_h=v_p90,
+        v_inf_p95_mm_h=v_p95,
+        v_inf_max_mm_h=v_max,
+        t_to_peak_min=ttp_min,
+        frac_active=frac_active,
+        active_h=active_h,
+    ), v_inf
 
-    Qr_m3s = (Qr_LH / 3600.0) / 1000.0
-    Qi_m3s = (Qi_LH / 3600.0) / 1000.0
 
-    Vr_m3 = np.cumsum(Qr_m3s) * dt_sec
-    Vi_m3 = np.cumsum(Qi_m3s) * dt_sec
+def plot_event_velocity(df_evt, v_inf, out_png: Path, title: str, dpi: int):
+    t = pd.DatetimeIndex(df_evt["date"])
+    P = pd.to_numeric(df_evt["P_mm"], errors="coerce").fillna(0.0).to_numpy(float)
+    Qinf = pd.to_numeric(df_evt["Q_inf_LH"], errors="coerce").fillna(0.0).to_numpy(float)
 
-    Hr_cum_mm = 1000.0 * Vr_m3 / area_m2
-    Hi_cum_mm = 1000.0 * Vi_m3 / area_m2
+    fig = plt.figure(figsize=(12, 6))
+    ax1 = fig.add_subplot(2, 1, 1)
+    ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
 
-    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-    ax2 = ax1.twinx()
-    ax2.bar(t, P, width=0.002, alpha=0.3)
-    ax2.set_ylabel("P (mm / pas)")
-
-    ax1.plot(t, Qr_LH, label="Q_ruiss (L/h)")
-    ax1.plot(t, Qi_LH, label="Q_inf (L/h)")
-    ax1.set_ylabel("Débit (L/h)")
+    # haut: Qinf et pluie (axe secondaire)
+    ax1.plot(t, Qinf, label="Q_inf (L/h)")
+    ax1.set_ylabel("Q_inf (L/h)")
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc="upper left")
 
-    ax3.plot(t, P_cum_mm, label="Pluie cumulée (mm)")
-    ax3.plot(t, Hr_cum_mm, label="Ruissellement cumulé (mm)")
-    ax3.plot(t, Hi_cum_mm, label="Infiltration cumulée (mm)")
-    ax3.set_ylabel("Cumul (mm)")
-    ax3.set_xlabel("Date")
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(loc="upper left")
+    ax1b = ax1.twinx()
+    # bar width en jours approx: on prend median dt
+    dt_s = infer_dt_seconds(t)
+    w = float(dt_s) / 86400.0
+    ax1b.bar(t, P, width=w, alpha=0.25)
+    ax1b.set_ylabel("P (mm/pas)")
+    ax1b.grid(False)
 
-    plt.suptitle(title)
-    plt.tight_layout()
+    # bas: v_inf
+    ax2.plot(t, v_inf, label="v_inf = Q_inf/A (mm/h)")
+    ax2.set_ylabel("v_inf (mm/h)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="upper left")
+    ax2.set_xlabel("Date")
+
+    fig.suptitle(title)
+    fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_png, dpi=PLOT_DPI)
+    fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
 
-def plot_event_volume_scatter(meta: pd.DataFrame, out_png: Path, use_mm=True):
-    """
-    Scatter inter-évènements:
-      - soit hr(mm) vs hp(mm) (use_mm=True)
-      - soit Vruiss(m3) vs Vpluie(m3) (use_mm=False)
-    + ligne y=x
-    """
-    if meta is None or len(meta) == 0:
+
+def hist_plot(x, xlabel, title, out_png: Path, dpi: int, bins=30):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) < 3:
         return
+    fig = plt.figure(figsize=(7, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.hist(x, bins=bins)
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=int(dpi))
+    plt.close(fig)
 
-    if use_mm:
-        x = meta["hp_mm"].to_numpy(dtype=float)
-        y = meta["hr_mm"].to_numpy(dtype=float)
-        xlabel = "hp (mm) pluie évènement"
-        ylabel = "hr (mm) ruissellement évènement"
-        title = "Nuage hr=f(hp) (mm)"
-    else:
-        A = float(A_SITE_M2)
-        Vp_m3 = meta["hp_mm"].to_numpy(dtype=float) * A / 1000.0
-        x = Vp_m3
-        y = meta["Vruiss_m3"].to_numpy(dtype=float)
-        xlabel = "Vpluie (m³)"
-        ylabel = "Vruiss (m³)"
-        title = "Nuage Vruiss=f(Vpluie) (m³)"
 
-    finite = np.isfinite(x) & np.isfinite(y)
-    if not np.any(finite):
+def scatter_plot(x, y, xlabel, ylabel, title, out_png: Path, dpi: int):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 3:
         return
-    xmax = float(np.max(x[finite]))
-    ymax = float(np.max(y[finite]))
-    m = max(xmax, ymax, 1.0)
-
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
-    ax.scatter(x, y, s=18, alpha=0.8)
-    ax.plot([0, m], [0, m], linewidth=1.5, alpha=0.7)
-
+    fig = plt.figure(figsize=(7, 5))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.scatter(x[m], y[m])
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    ax.grid(True, alpha=0.25)
-
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=PLOT_DPI)
-    plt.close(fig)
-
-def plot_hr_hp_with_event_ids(meta: pd.DataFrame, out_png: Path,
-                              x_max: float = None, y_max: float = None,
-                              max_list: int = 140,
-                              label_only_in_window: bool = False):
-    """
-    Scatter hr(mm) vs hp(mm) avec:
-      - un numéro sur chaque point
-      - une colonne texte à droite: numéro -> event_id (+ hp/hr)
-    Option:
-      - x_max/y_max: applique un zoom (xlim/ylim)
-      - label_only_in_window: si True, ne numérote/liste QUE les points dans la fenêtre.
-    """
-    if meta is None or len(meta) == 0:
-        return
-
-    dfp = meta.copy()
-    dfp["hp_mm"] = pd.to_numeric(dfp["hp_mm"], errors="coerce")
-    dfp["hr_mm"] = pd.to_numeric(dfp["hr_mm"], errors="coerce")
-    dfp = dfp[np.isfinite(dfp["hp_mm"]) & np.isfinite(dfp["hr_mm"])].reset_index(drop=True)
-    if len(dfp) == 0:
-        return
-
-    # Filtre fenêtre si demandé
-    if x_max is not None or y_max is not None:
-        mask = np.ones(len(dfp), dtype=bool)
-        if x_max is not None:
-            mask &= (dfp["hp_mm"].to_numpy() <= float(x_max))
-        if y_max is not None:
-            mask &= (dfp["hr_mm"].to_numpy() <= float(y_max))
-        if label_only_in_window:
-            dfp = dfp[mask].reset_index(drop=True)
-
-    fig = plt.figure(figsize=(13, 7))
-    gs = fig.add_gridspec(1, 2, width_ratios=[3.2, 1.8])
-    ax = fig.add_subplot(gs[0, 0])
-    ax_txt = fig.add_subplot(gs[0, 1])
-
-    x = dfp["hp_mm"].to_numpy(dtype=float)
-    y = dfp["hr_mm"].to_numpy(dtype=float)
-
-    ax.scatter(x, y, s=18, alpha=0.85)
-
-    xmax = float(np.max(x)) if x_max is None else float(x_max)
-    ymax = float(np.max(y)) if y_max is None else float(y_max)
-    m = max(xmax, ymax, 1.0)
-    ax.plot([0, m], [0, m], linewidth=1.2, alpha=0.6)
-
-    if x_max is not None:
-        ax.set_xlim(0, float(x_max))
-    if y_max is not None:
-        ax.set_ylim(0, float(y_max))
-
-    ax.set_xlabel("hp (mm) pluie évènement")
-    ax.set_ylabel("hr (mm) ruissellement évènement")
-    title = "Nuage hr=f(hp) avec identifiants"
-    if x_max is not None or y_max is not None:
-        title += f" (zoom: hp≤{x_max if x_max is not None else '∞'} ; hr≤{y_max if y_max is not None else '∞'})"
-    ax.set_title(title)
-    ax.grid(True, alpha=0.25)
-
-    ax_txt.axis("off")
-
-    n = len(dfp)
-    if n > max_list:
-        dfp = dfp.sort_values(["hr_mm", "hp_mm"], ascending=False).head(max_list).reset_index(drop=True)
-        x = dfp["hp_mm"].to_numpy(dtype=float)
-        y = dfp["hr_mm"].to_numpy(dtype=float)
-        n = len(dfp)
-
-    for k in range(n):
-        ax.text(
-            x[k], y[k], str(k + 1),
-            fontsize=8, ha="left", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.15", alpha=0.25, linewidth=0.0)
-        )
-
-    lines = []
-    for k in range(n):
-        eid = str(dfp.loc[k, "event_id"])
-        hp = float(dfp.loc[k, "hp_mm"])
-        hr = float(dfp.loc[k, "hr_mm"])
-        lines.append(f"{k+1:>3}  {eid}  (hp={hp:.2f}, hr={hr:.2f})")
-
-    ax_txt.text(0.0, 1.0, "\n".join(lines), va="top", ha="left", fontsize=9, family="monospace")
-
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=PLOT_DPI)
-    plt.close(fig)
-
-def plot_mean_infiltration_per_event(meta: pd.DataFrame, out_png: Path):
-    """
-    Courbe (index évènement) -> vitesse moyenne d'infiltration (mm/h)
-    v_inf = hi_mm / (dur_h)
-    """
-    dfp = meta.copy()
-    dfp = dfp[np.isfinite(dfp["v_inf_mm_h"])].reset_index(drop=True)
-    if len(dfp) == 0:
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(
-        range(len(dfp)),
-        dfp["v_inf_mm_h"].to_numpy(dtype=float),
-        marker="o", linestyle="-", alpha=0.8
-    )
-    ax.set_xlabel("Index évènement")
-    ax.set_ylabel("Vitesse d'infiltration moyenne (mm/h)")
-    ax.set_title("Vitesse d'infiltration moyenne par évènement")
     ax.grid(True, alpha=0.3)
-
+    fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=PLOT_DPI)
+    fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
 
-def plot_infiltration_velocity_distribution(meta: pd.DataFrame, out_png: Path):
-    """
-    Histogramme des vitesses d'infiltration moyennes (mm/h)
-    """
-    dfp = meta.copy()
-    v = pd.to_numeric(dfp["v_inf_mm_h"], errors="coerce").to_numpy(dtype=float)
-    v = v[np.isfinite(v)]
-    v = v[v > 0]
-    if len(v) == 0:
-        return
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.hist(v, bins=25, alpha=0.85)
-
-    ax.set_xlabel("Vitesse d'infiltration moyenne (mm/h)")
-    ax.set_ylabel("Nombre d'évènements")
-    ax.set_title("Distribution des vitesses d'infiltration moyennes")
-    ax.grid(True, alpha=0.3)
-
-    p50 = float(np.percentile(v, 50))
-    p75 = float(np.percentile(v, 75))
-    p90 = float(np.percentile(v, 90))
-
-    ax.axvline(p50, linestyle="--", linewidth=1.5, label=f"P50 = {p50:.2f}")
-    ax.axvline(p75, linestyle="--", linewidth=1.2, label=f"P75 = {p75:.2f}")
-    ax.axvline(p90, linestyle="--", linewidth=1.0, label=f"P90 = {p90:.2f}")
-    ax.legend()
-
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=PLOT_DPI)
-    plt.close(fig)
-
-# ======================================================================
+# =========================================================
 # MAIN
-# ======================================================================
-
+# =========================================================
 def main():
-    if not DATA_FILE.exists():
-        raise FileNotFoundError(f"Fichier introuvable: {DATA_FILE}")
+    cfg = get_config()
+    out_dir = Path(cfg["OUT_DIR"])
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(DATA_FILE, sep=";")
+    meta_path = Path(cfg["META_EVENTS"])
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Méta events introuvable: {meta_path}")
 
-    required = ["Date", "Hauteur_de_pluie_mm", "Q_inf_LH", "Q_ruiss_LH"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Colonnes manquantes: {missing}\nColonnes présentes: {list(df.columns)}")
+    meta = pd.read_csv(meta_path, sep=";")
+    if meta.shape[1] < 2:
+        raise RuntimeError("hr_hp_events.csv doit avoir au moins 2 colonnes (année, id/num).")
 
-    df = parse_datetime_series(df)
-    df["P_mm"] = pd.to_numeric(df["Hauteur_de_pluie_mm"], errors="coerce").fillna(0.0)
-    df["Q_inf_LH"] = pd.to_numeric(df["Q_inf_LH"], errors="coerce").fillna(0.0)
-    df["Q_ruiss_LH"] = pd.to_numeric(df["Q_ruiss_LH"], errors="coerce").fillna(0.0)
-    df = df.sort_values("date").reset_index(drop=True)
+    rows = []
+    all_v_samples = []  # pour histogramme global
+    event_series = []   # pour feuille Excel "time series" optionnelle
 
-    dt_sec = infer_dt_seconds(df["date"])
-    print(f"[INFO] dt estimé = {dt_sec:.1f} s")
+    events_root = Path(cfg["EVENTS_ROOT"])
+    A_site = float(cfg["A_SITE_M2"])
 
-    P  = df["P_mm"].to_numpy(dtype=float)
-    Qr = df["Q_ruiss_LH"].to_numpy(dtype=float)
-    Qi = df["Q_inf_LH"].to_numpy(dtype=float)
+    n_ok = 0
+    n_skip = 0
 
-    core_events = find_core_events(P, Qr, dt_sec)
-    print(f"[INFO] Nombre d'évènements noyau détectés : {len(core_events)}")
-
-    OUT_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    meta_rows = []
-    event_counters = {}
-    skips = {"soft_filter": 0, "no_clean_start": 0, "no_clean_end": 0, "written": 0}
-
-    for (i0_core, i1_core) in core_events:
-        df_core = df.iloc[i0_core:i1_core+1][["date", "P_mm", "Q_inf_LH", "Q_ruiss_LH"]].copy()
-
-        dur_core_min = len(df_core) * dt_sec / 60.0
-        hp_core = float(df_core["P_mm"].sum())
-        qmax_core = float(df_core["Q_ruiss_LH"].max()) if len(df_core) else 0.0
-
-        # soft filters
-        if dur_core_min < MIN_CORE_DURATION_MIN or hp_core < MIN_HP_MM or qmax_core < MIN_QMAX_RUISS_LH:
-            skips["soft_filter"] += 1
+    for _, r in meta.iterrows():
+        year, evt_num = parse_year_evt(r)
+        if year is None or evt_num is None:
+            n_skip += 1
             continue
 
-        # start/end propres
-        i0_evt = find_clean_start(i0_core, P, Qr, Qi, dt_sec)
-        if i0_evt is None:
-            skips["no_clean_start"] += 1
+        name, df_evt = read_event_csv(events_root, year, evt_num, sep=";")
+        if df_evt is None:
+            n_skip += 1
             continue
 
-        i1_evt = find_clean_end(i1_core, P, Qr, Qi, dt_sec)
-        if i1_evt is None:
-            skips["no_clean_end"] += 1
-            continue
-
-        df_evt = df.iloc[i0_evt:i1_evt+1][["date", "P_mm", "Q_inf_LH", "Q_ruiss_LH"]].copy()
-
-        met_evt = compute_event_metrics(df_evt, dt_sec, A_SITE_M2)
-        yr = int(df_evt["date"].iloc[0].year)
-
-        event_counters.setdefault(yr, 0)
-        event_counters[yr] += 1
-        eid = f"event_{yr}_{event_counters[yr]:03d}"
-
-        out_csv = OUT_EVENTS_DIR / f"{yr}" / f"{eid}.csv"
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-        df_evt.to_csv(out_csv, sep=";", index=False)
-
-        # plot : event + optionnel post-pad uniquement visuel
-        if MAKE_PLOTS:
-            i1_plot = i1_evt
-            if PLOT_POST_PAD_MIN > 0:
-                add = int(np.ceil((PLOT_POST_PAD_MIN * 60.0) / dt_sec))
-                i1_plot = min(i1_evt + add, len(df) - 1)
-            df_plot = df.iloc[i0_evt:i1_plot+1][["date", "P_mm", "Q_inf_LH", "Q_ruiss_LH"]].copy()
-
-            out_png = OUT_PLOTS_DIR / f"{yr}" / f"{eid}.png"
-            title = (
-                f"{eid} | hp={met_evt['hp_mm']:.2f} mm | hr={met_evt['hr_mm']:.2f} mm | hi={met_evt['hi_mm']:.2f} mm | "
-                f"Qmax={met_evt['Qmax_ruiss_LH']:.2f} L/h | dur={met_evt['dur_min']:.0f} min"
-            )
-            plot_event(df_plot, out_png, title, dt_sec=dt_sec, area_m2=A_SITE_M2)
-
-        meta_rows.append(dict(
-            year=yr,
-            event_id=eid,
-            dt_sec=dt_sec,
-            i0_core=i0_core, i1_core=i1_core,
-            i0_evt=i0_evt, i1_evt=i1_evt,
-            file_csv=str(out_csv),
-
-            hp_mm=met_evt["hp_mm"],
-            hr_mm=met_evt["hr_mm"],
-            hi_mm=met_evt["hi_mm"],
-            Vruiss_m3=met_evt["Vruiss_m3"],
-            Vinf_m3=met_evt["Vinf_m3"],
-            Qmax_ruiss_LH=met_evt["Qmax_ruiss_LH"],
-            Qmax_inf_LH=met_evt["Qmax_inf_LH"],
-            dur_evt_min=met_evt["dur_min"],
-        ))
-
-        skips["written"] += 1
-
-    meta = pd.DataFrame(meta_rows)
-
-    # --- VITESSE D'INFILTRATION MOYENNE PAR EVENEMENT (mm/h)
-    if len(meta):
-        meta["v_inf_mm_h"] = meta["hi_mm"] * 60.0 / meta["dur_evt_min"]
-    else:
-        meta["v_inf_mm_h"] = []
-
-    out_meta = OUT_EVENTS_DIR / "hr_hp_events.csv"
-    meta.to_csv(out_meta, sep=";", index=False)
-
-    # --- PLOTS DE SYNTHESE inter-évènements
-    if MAKE_PLOTS and len(meta):
-        out_scatter_mm = OUT_PLOTS_DIR / "SUMMARY_hr_hp_mm.png"
-        plot_event_volume_scatter(meta, out_scatter_mm, use_mm=True)
-
-        out_scatter_m3 = OUT_PLOTS_DIR / "SUMMARY_Vruiss_Vpluie_m3.png"
-        plot_event_volume_scatter(meta, out_scatter_m3, use_mm=False)
-
-        # scatter avec IDs
-        out_ids = OUT_PLOTS_DIR / "SUMMARY_hr_hp_mm_WITH_IDS.png"
-        plot_hr_hp_with_event_ids(meta, out_ids, max_list=160)
-
-        # scatter zoomé hp<=60, hr<=35
-        out_zoom = OUT_PLOTS_DIR / "SUMMARY_hr_hp_mm_ZOOM_60_35_WITH_IDS.png"
-        plot_hr_hp_with_event_ids(
-            meta, out_zoom,
-            x_max=60.0, y_max=35.0,
-            max_list=250,
-            label_only_in_window=True
+        met, v_inf = compute_velocity_metrics(
+            df_evt=df_evt,
+            A_site_m2=A_site,
+            clip_qinf_negative=bool(cfg["CLIP_QINF_NEGATIVE"]),
+            qinf_zero_thr_lh=float(cfg["QINF_ZERO_THR_LH"]),
         )
 
-        # vitesse moyenne par évènement + distribution
-        out_v_evt = OUT_PLOTS_DIR / "INFILTRATION_MEAN_PER_EVENT.png"
-        plot_mean_infiltration_per_event(meta, out_v_evt)
+        met.update(dict(
+            year=int(year),
+            evt_num=int(evt_num),
+            event_name=str(name),
+            file_csv=str(events_root / str(year) / f"{name}.csv"),
+        ))
+        rows.append(met)
 
-        out_v_dist = OUT_PLOTS_DIR / "INFILTRATION_VELOCITY_DISTRIBUTION.png"
-        plot_infiltration_velocity_distribution(meta, out_v_dist)
+        # garde des échantillons pour histo global
+        vv = np.asarray(v_inf, float)
+        vv = vv[np.isfinite(vv)]
+        if len(vv):
+            all_v_samples.append(vv)
 
-        print(f"[OK] Scatter mm   : {out_scatter_mm}")
-        print(f"[OK] Scatter m3   : {out_scatter_m3}")
-        print(f"[OK] Scatter IDs  : {out_ids}")
-        print(f"[OK] Scatter ZOOM : {out_zoom}")
-        print(f"[OK] v_inf/event  : {out_v_evt}")
-        print(f"[OK] v_inf histo  : {out_v_dist}")
+        # série pour feuille Excel (sparse)
+        df_s = pd.DataFrame({
+            "event_name": name,
+            "date": pd.to_datetime(df_evt["date"]),
+            "P_mm": pd.to_numeric(df_evt["P_mm"], errors="coerce"),
+            "Q_inf_LH": pd.to_numeric(df_evt["Q_inf_LH"], errors="coerce"),
+            "v_inf_mm_h": v_inf,
+        })
+        event_series.append(df_s)
 
-    print(f"[OK] Evènements exportés (propres) : {len(meta)}")
-    print(f"[OK] Méta-fichier : {out_meta}")
-    print(f"[INFO] Skips: {skips}")
+        n_ok += 1
 
-    if len(meta):
-        print(meta[[
-            "year", "event_id", "hp_mm", "hr_mm", "hi_mm",
-            "v_inf_mm_h", "Qmax_ruiss_LH", "dur_evt_min"
-        ]].head(15))
+    df_out = pd.DataFrame(rows).sort_values(["year", "evt_num"]).reset_index(drop=True)
+    print(f"[OK] Evènements analysés: {n_ok} | skip: {n_skip}")
+
+    # Excel
+    out_xlsx = out_dir / cfg["OUT_XLSX_NAME"]
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xw:
+        df_out.to_excel(xw, sheet_name="event_metrics", index=False)
+
+        # feuille time series (grosse) -> tu peux commenter si trop lourd
+        if len(event_series):
+            ts = pd.concat(event_series, ignore_index=True)
+            ts.to_excel(xw, sheet_name="v_inf_timeseries", index=False)
+
+    print(f"[OK] Excel -> {out_xlsx}")
+
+    # Plots synthèse
+    if bool(cfg["MAKE_SUMMARY_PNG"]) and len(df_out) > 0:
+        v_global = np.concatenate(all_v_samples) if len(all_v_samples) else np.array([], float)
+
+        hist_plot(
+            v_global,
+            xlabel="v_inf (mm/h) [tous pas, tous évènements]",
+            title="Distribution globale du champ v_inf(t)",
+            out_png=out_dir / "HIST_v_inf_all_samples.png",
+            dpi=int(cfg["DPI"]),
+            bins=40
+        )
+
+        # Distribution des stats par évènement
+        hist_plot(df_out["v_inf_mean_mm_h"], "v_inf mean (mm/h)", "Distribution v_inf_mean (par évènement)",
+                  out_dir / "HIST_v_inf_mean_per_event.png", int(cfg["DPI"]), bins=30)
+        hist_plot(df_out["v_inf_p95_mm_h"], "v_inf p95 (mm/h)", "Distribution v_inf_p95 (par évènement)",
+                  out_dir / "HIST_v_inf_p95_per_event.png", int(cfg["DPI"]), bins=30)
+        hist_plot(df_out["v_inf_max_mm_h"], "v_inf max (mm/h)", "Distribution v_inf_max (par évènement)",
+                  out_dir / "HIST_v_inf_max_per_event.png", int(cfg["DPI"]), bins=30)
+
+        # Relations utiles
+        scatter_plot(df_out["hp_mm"], df_out["v_inf_p95_mm_h"],
+                     "hp (mm)", "v_inf p95 (mm/h)",
+                     "Intensité infiltration (p95) vs pluie totale",
+                     out_dir / "SCAT_vp95_vs_hp.png", int(cfg["DPI"]))
+        scatter_plot(df_out["hi_mm"], df_out["v_inf_p95_mm_h"],
+                     "hi (mm)", "v_inf p95 (mm/h)",
+                     "Intensité infiltration (p95) vs lame infiltrée",
+                     out_dir / "SCAT_vp95_vs_hi.png", int(cfg["DPI"]))
+        scatter_plot(df_out["duration_h"], df_out["v_inf_mean_mm_h"],
+                     "Durée (h)", "v_inf mean (mm/h)",
+                     "v_inf_mean vs durée (signature drainage / plateau)",
+                     out_dir / "SCAT_vmean_vs_duration.png", int(cfg["DPI"]))
+        scatter_plot(df_out["t_to_peak_min"], df_out["v_inf_max_mm_h"],
+                     "Temps au pic (min)", "v_inf max (mm/h)",
+                     "Réactivité infiltration: pic vs temps au pic",
+                     out_dir / "SCAT_vmax_vs_ttp.png", int(cfg["DPI"]))
+
+        print(f"[OK] Plots synthèse -> {out_dir}")
+
+    # Courbes par évènement
+    if bool(cfg["MAKE_EVENT_PNG"]) and len(df_out) > 0:
+        out_ev_dir = out_dir / "EVENTS"
+        out_ev_dir.mkdir(parents=True, exist_ok=True)
+
+        df_plot = df_out.copy()
+        mode = str(cfg["EVENT_PLOT_MODE"]).lower()
+        if mode == "topn":
+            key = str(cfg["TOP_BY"])
+            if key in df_plot.columns:
+                df_plot = df_plot.sort_values(key, ascending=False).head(int(cfg["TOP_N"]))
+            else:
+                df_plot = df_plot.head(int(cfg["TOP_N"]))
+
+        for _, rr in df_plot.iterrows():
+            # reload event pour plot (simple, robuste)
+            m = re.search(r"event_(\d{4})_(\d{1,4})", str(rr["event_name"]))
+            if not m:
+                continue
+            y = int(m.group(1))
+            n = int(m.group(2))
+            name, df_evt = read_event_csv(events_root, y, n, sep=";")
+            if df_evt is None:
+                continue
+
+            _, v_inf = compute_velocity_metrics(
+                df_evt=df_evt,
+                A_site_m2=A_site,
+                clip_qinf_negative=bool(cfg["CLIP_QINF_NEGATIVE"]),
+                qinf_zero_thr_lh=float(cfg["QINF_ZERO_THR_LH"]),
+            )
+
+            title = (
+                f"{name} | v_mean={rr['v_inf_mean_mm_h']:.2f} mm/h | "
+                f"v_p95={rr['v_inf_p95_mm_h']:.2f} | v_max={rr['v_inf_max_mm_h']:.2f} | "
+                f"hp={rr['hp_mm']:.2f} mm | hi={rr['hi_mm']:.2f} mm | dur={rr['duration_h']:.2f} h"
+            )
+            plot_event_velocity(
+                df_evt=df_evt,
+                v_inf=v_inf,
+                out_png=out_ev_dir / f"{name}_v_inf.png",
+                title=title,
+                dpi=int(cfg["DPI"])
+            )
+
+        print(f"[OK] Courbes v_inf(t) -> {out_ev_dir}")
+
+    print("[DONE]")
+
 
 if __name__ == "__main__":
     main()
