@@ -23,9 +23,6 @@ def m3s_to_lh(q_m3s):
 def mm_per_step_to_mps(mm_step, dt_s):
     return np.asarray(mm_step, float) * 1e-3 / float(dt_s)
 
-def infil_mm_h_to_m_s(v_mm_h):
-    return v_mm_h * 1e-3 / 3600.0
-
 # =========================================================
 # ETP synthétique
 # =========================================================
@@ -45,7 +42,7 @@ def build_constant_daytime_etp_rate(time_index: pd.DatetimeIndex,
     return etp
 
 # =========================================================
-# Lecture event CSV (CSR)
+# Lecture event CSV 
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
 
@@ -385,48 +382,19 @@ def print_mass_balance(mb: dict):
 
 
 def k_from_tau(tau_hours):
-    """
-    Convertit un temps de demi-vidange (tau, en heures) 
-    en coefficient de vidange k (en s^-1).
-
-    Paramètres
-    ----------
-    tau_hours : float
-        Temps de demi-vidange en heures.
-
-    Retour
-    ------
-    k : float
-        Coefficient de vidange en s^-1.
-    """
+  
     tau_seconds = tau_hours * 3600.0
     return np.log(2.0) / tau_seconds
 
 def infil_mm_h_to_m_s(v_mm_h):
-    """
-    Convertit une vitesse d'infiltration en mm/h vers m/s.
-
-    Paramètres
-    ----------
-    v_mm_h : float
-        Vitesse en mm/h.
-
-    Retour
-    ------
-    v_m_s : float
-        Vitesse en m/s.
-    """
+  
     return v_mm_h * 1e-3 / 3600.0
 
 def tau_from_k_seconds(k):
-    """
-    k : coefficient de vidange en s^-1
-    Retourne tau en secondes, minutes, heures
-    """
     if k <= 0:
         return np.inf
 
-    tau_s = 1.0 / k      # secondes
+    tau_s = 1.0 / k     
     tau_min = tau_s / 60
     tau_h = tau_s / 3600
 
@@ -452,7 +420,7 @@ def main():
     # ---- init (centres)
     k_runoff1_init  = 1.7e-3   # s^-1
     k_runoff2_init  = 1.7e-3   # s^-1 
-    k_seepage_init  = 6.5e-05                # s^-1
+    k_seepage_init  = 6.5e-05  # s^-1
 
     print("=== PARAMÈTRES INIT (centres) ===")
     print(f"A_BV_M2      = {A_BV_M2:.1f} m²")
@@ -475,11 +443,11 @@ def main():
     print(f"[INFO] dt obs = {dt_obs:.1f} s | dt interne = {DT_INTERNAL:.1f} s")
 
     # ---- option : infiltration peut-elle pomper h_r1 ?
-    INFIL_FROM_SURFACE = False  # mets False si tu veux mécaniquement plus de ruissellement
+    INFIL_FROM_SURFACE = False  # mettre False si on veux mécaniquement plus de ruissellement
 
     # ---- bornes k_infiltr en mm/h (calage)
-    KINF_MIN_MM_H = 0.03
-    KINF_MAX_MM_H = 0.35
+    KINF_MIN_MM_H = 0.1
+    KINF_MAX_MM_H = 0.5
     ki_lo = infil_mm_h_to_m_s(KINF_MIN_MM_H)
     ki_hi = infil_mm_h_to_m_s(KINF_MAX_MM_H)
 
