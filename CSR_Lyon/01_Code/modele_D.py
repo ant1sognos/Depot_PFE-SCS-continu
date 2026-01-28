@@ -1,6 +1,42 @@
 # -*- coding: utf-8 -*-
+"""
+SCS-HSM continu — VERSION CASCADE (r1 -> r2) + SUBSTEPPING
+APPLIQUÉ AU PARKING CSR (calage évènementiel)
+-----------------------------------------------------------
+
+Entrée canonique CSR :
+    - Date                : datetime
+    - Hauteur_de_pluie_mm : pluie (mm/pas)
+    - Q_inf_LH            : débit infiltré (L/h) (optionnel)
+    - Q_ruiss_LH          : débit ruisselé (L/h) (Q_obs)
+
+Compatibilité anciens exports :
+    - date / dateP à la place de Date
+    - P_mm à la place de Hauteur_de_pluie_mm
+    - Q_ls (L/s) à la place de Q_ruiss_LH (L/h)
+
+Modèle :
+    - h_a  : abstraction Ia
+    - h_s  : sol (capacité S)
+    - h_r1 : réservoir ruissellement 1
+    - h_r2 : réservoir ruissellement 2
+    - substepping dt_int : intégration interne plus fine
+    - cascade r1->r2 : solution exacte du réservoir linéaire à entrée constante sur dt_int
+
+Calage (optionnel) :
+    - theta = [log10(k_infiltr), log10(k_runoff1), log10(k_runoff2), log10(k_seepage)]
+    - critère : RMSE sur Q_ruiss (L/h) par défaut (comme ton script)
+
+Sorties :
+    - Figures dans ../03_Plots/Parking_CSR_CASCADE/<event_name>/
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
 import math
+import re
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -11,8 +47,9 @@ mpl.rcParams["path.simplify"] = True
 mpl.rcParams["path.simplify_threshold"] = 1.0
 mpl.rcParams["agg.path.chunksize"] = 10000
 
+
 # =========================================================
-# Conversions
+# Conversions (unités)
 # =========================================================
 def lh_to_m3s(q_lh):
     return np.asarray(q_lh, float) / 1000.0 / 3600.0
@@ -23,13 +60,23 @@ def m3s_to_lh(q_m3s):
 def mm_per_step_to_mps(mm_step, dt_s):
     return np.asarray(mm_step, float) * 1e-3 / float(dt_s)
 
+def infil_mm_h_to_m_s(v_mm_h):
+    return float(v_mm_h) * 1e-3 / 3600.0
+
+
 # =========================================================
-# ETP synthétique
+# ETP synthétique (optionnel)
 # =========================================================
-def build_constant_daytime_etp_rate(time_index: pd.DatetimeIndex,
-                                    etp_mm_per_day=2.0,
-                                    start_hour=8,
-                                    end_hour=20) -> np.ndarray:
+def build_constant_daytime_etp_rate(
+    time_index: pd.DatetimeIndex,
+    etp_mm_per_day: float = 2.0,
+    start_hour: int = 8,
+    end_hour: int = 20,
+) -> np.ndarray:
+    """
+    ETP journalière répartie uniformément entre start_hour et end_hour (0 sinon).
+    Sortie en m/s.
+    """
     nt = len(time_index)
     etp = np.zeros(nt, dtype=float)
     active_hours = max(end_hour - start_hour, 1)
@@ -41,58 +88,97 @@ def build_constant_daytime_etp_rate(time_index: pd.DatetimeIndex,
             etp[i] = (etp_mm_h / 1000.0) / 3600.0  # m/s
     return etp
 
+
 # =========================================================
-# Lecture event CSV 
+# Lecture event CSV (CSR robuste)
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
 
-def read_parking_event_csv(csv_event_rel, sep=";"):
+def _infer_dayfirst(date_series: pd.Series) -> bool:
+    s = date_series.astype(str).dropna().head(25).tolist()
+    if not s:
+        return False
+    slash_like = sum(bool(re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", x)) for x in s)
+    iso_like   = sum(bool(re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", x)) for x in s)
+    return slash_like > iso_like
+
+def read_parking_event_csv(csv_event_rel: str, sep: str = ";"):
+    """
+    Retourne :
+        time_index, P_mm, Q_inf_LH_or_None, Q_ruiss_LH, dt_sec
+    """
     csv_path = BASE_DIR / "02_Data" / Path(csv_event_rel)
     if not csv_path.exists():
         raise FileNotFoundError(f"Event CSV introuvable: {csv_path}")
 
-    df = pd.read_csv(csv_path, sep=sep)
+    df = pd.read_csv(csv_path, sep=sep, na_values=["NA", "NaN", "", -9999, -9999.0])
 
-    required = ["date", "P_mm", "Q_inf_LH", "Q_ruiss_LH"]
-    miss = [c for c in required if c not in df.columns]
-    if miss:
-        raise ValueError(f"Colonnes manquantes {miss} dans {csv_path.name}. Colonnes présentes={list(df.columns)}")
+    # Date
+    date_col = next((c for c in ["Date", "date", "dateP"] if c in df.columns), None)
+    if date_col is None:
+        raise ValueError(f"Colonne date introuvable dans {csv_path.name}. Colonnes présentes={list(df.columns)}")
 
+    dayfirst = _infer_dayfirst(df[date_col])
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"], format="%Y-%m-%d %H:%M:%S", errors="raise")
-    df = df.sort_values("date").reset_index(drop=True)
-    time_index = pd.DatetimeIndex(df["date"])
+    df[date_col] = pd.to_datetime(df[date_col], dayfirst=dayfirst, errors="raise")
+    df = df.sort_values(date_col).reset_index(drop=True)
+    time_index = pd.DatetimeIndex(df[date_col])
 
     diffs = time_index.to_series().diff().dropna().dt.total_seconds()
     if len(diffs) == 0:
         raise ValueError(f"Série trop courte pour inférer dt: {csv_path.name}")
     dt_sec = float(np.median(diffs))
 
-    P_mm = pd.to_numeric(df["P_mm"], errors="coerce").fillna(0.0).to_numpy(float)
-    Q_inf_LH = pd.to_numeric(df["Q_inf_LH"], errors="coerce").fillna(0.0).to_numpy(float)
-    Q_ruiss_LH = pd.to_numeric(df["Q_ruiss_LH"], errors="coerce").fillna(0.0).to_numpy(float)
-
+    # Pluie
+    p_col = "Hauteur_de_pluie_mm" if "Hauteur_de_pluie_mm" in df.columns else ("P_mm" if "P_mm" in df.columns else None)
+    if p_col is None:
+        raise ValueError(f"Colonne pluie introuvable dans {csv_path.name}. Attendu Hauteur_de_pluie_mm ou P_mm.")
+    P_mm = pd.to_numeric(df[p_col], errors="coerce").fillna(0.0).to_numpy(float)
     P_mm = np.clip(P_mm, 0.0, None)
-    Q_inf_LH = np.clip(Q_inf_LH, 0.0, None)
-    Q_ruiss_LH = np.clip(Q_ruiss_LH, 0.0, None)
+
+    # Q ruiss obs
+    if "Q_ruiss_LH" in df.columns:
+        Q_ruiss_LH = pd.to_numeric(df["Q_ruiss_LH"], errors="coerce").fillna(0.0).to_numpy(float)
+        Q_ruiss_LH = np.clip(Q_ruiss_LH, 0.0, None)
+    elif "Q_ls" in df.columns:
+        q_ls = pd.to_numeric(df["Q_ls"], errors="coerce").fillna(0.0).to_numpy(float)
+        q_ls = np.clip(q_ls, 0.0, None)
+        Q_ruiss_LH = m3s_to_lh(q_ls / 1000.0)  # L/s -> m³/s -> L/h
+    else:
+        raise ValueError(f"Colonne Q obs introuvable dans {csv_path.name}. Attendu Q_ruiss_LH ou Q_ls.")
+
+    # Q inf obs (optionnel)
+    Q_inf_LH = None
+    if "Q_inf_LH" in df.columns:
+        Q_inf_LH = pd.to_numeric(df["Q_inf_LH"], errors="coerce").fillna(0.0).to_numpy(float)
+        Q_inf_LH = np.clip(Q_inf_LH, 0.0, None)
 
     return time_index, P_mm, Q_inf_LH, Q_ruiss_LH, dt_sec
 
-# =========================================================
-# Modèle SCS-HSM avec SUBSTEPPING + routage CASCADE r1->r2
-# =========================================================
-def run_scs_hsm_cascade(dt_obs,
-                        p_rate, etp_rate,
-                        i_a, s,
-                        k_infiltr,      # m/s
-                        k_seepage,      # s^-1
-                        k_runoff1,      # s^-1
-                        k_runoff2,      # s^-1
-                        dt_internal=None,
-                        infil_from_surface=True):
 
+# =========================================================
+# Modèle SCS-HSM CASCADE + SUBSTEPPING
+# =========================================================
+def run_scs_hsm_cascade(
+    dt_obs: float,
+    p_rate: np.ndarray,
+    etp_rate: np.ndarray,
+    i_a: float,
+    s: float,
+    k_infiltr: float,   # m/s
+    k_seepage: float,   # s^-1
+    k_runoff1: float,   # s^-1
+    k_runoff2: float,   # s^-1
+    dt_internal: float | None = None,
+    infil_from_surface: bool = True,
+) -> dict:
+    """
+    Substepping sur dt_int, cascade r1->r2 (réservoirs linéaires exacts).
+    Sorties au pas dt_obs (m/s pour q/infil/r_gen/r_out ; m/pas pour sa_loss/seep_loss).
+    """
     p_rate = np.nan_to_num(np.asarray(p_rate, float), nan=0.0)
     etp_rate = np.nan_to_num(np.asarray(etp_rate, float), nan=0.0)
+
     nt = len(p_rate)
     dt_obs = float(dt_obs)
 
@@ -110,19 +196,19 @@ def run_scs_hsm_cascade(dt_obs,
     if abs(nsub * dt_int - dt_obs) > 1e-6:
         raise ValueError(f"dt_internal doit diviser dt_obs. Ici dt_obs={dt_obs}, dt_internal={dt_internal}")
 
-    # Etats
+    # Etats (m)
     h_a  = np.zeros(nt + 1)
     h_s  = np.zeros(nt + 1)
     h_r1 = np.zeros(nt + 1)
     h_r2 = np.zeros(nt + 1)
 
-    # Flux
+    # Flux au pas obs
     q = np.zeros(nt)          # m/s
     infil = np.zeros(nt)      # m/s
     r_gen = np.zeros(nt)      # m/s
     r_out = np.zeros(nt)      # m/s (sortie r2)
-    sa_loss = np.zeros(nt)    # m/pas obs
-    seep_loss = np.zeros(nt)  # m/pas obs
+    sa_loss = np.zeros(nt)    # m / pas obs (ET Ia)
+    seep_loss = np.zeros(nt)  # m / pas obs
 
     for n in range(nt):
         h_a_c  = h_a[n]
@@ -136,9 +222,8 @@ def run_scs_hsm_cascade(dt_obs,
         etp = float(etp_rate[n])
 
         for _ in range(nsub):
-            # 1) ET Ia
-            etp_pot = etp * dt_int
-            etp_eff = min(etp_pot, h_a_c)
+            # 1) ET sur Ia
+            etp_eff = min(etp * dt_int, h_a_c)
             h_a_c -= etp_eff
             sa_vol += etp_eff
 
@@ -159,11 +244,8 @@ def run_scs_hsm_cascade(dt_obs,
             infil_pot = (h_s_target - h_s_c) / dt_int  # m/s
 
             # 4) limitation par eau dispo
-            if infil_from_surface:
-                water_rate = q_n + h_r1_c / dt_int
-            else:
-                water_rate = q_n
-            water_rate = max(0.0, water_rate)
+            water_rate = q_n + (h_r1_c / dt_int if infil_from_surface else 0.0)
+            water_rate = max(water_rate, 0.0)
 
             infil_n = max(0.0, min(infil_pot, water_rate))
             infil_vol += infil_n * dt_int
@@ -190,7 +272,7 @@ def run_scs_hsm_cascade(dt_obs,
             r_gen_n = max(q_n - infil_from_rain, 0.0)
             rgen_vol += r_gen_n * dt_int
 
-            # 7) routage cascade r1 -> r2 (solution exacte)
+            # 7) cascade r1 -> r2 (solution exacte)
 
             # r1: entrée = r_gen_n - infil_from_hr
             b1 = r_gen_n - infil_from_hr
@@ -222,15 +304,19 @@ def run_scs_hsm_cascade(dt_obs,
 
             rout_vol += Vout2
 
-        h_a[n+1]  = h_a_c
-        h_s[n+1]  = h_s_c
-        h_r1[n+1] = h_r1_c
-        h_r2[n+1] = h_r2_c
+        # stockage états
+        h_a[n + 1]  = h_a_c
+        h_s[n + 1]  = h_s_c
+        h_r1[n + 1] = h_r1_c
+        h_r2[n + 1] = h_r2_c
 
+        # débits surfaciques moyens sur dt_obs
         q[n]         = q_vol / dt_obs
         infil[n]     = infil_vol / dt_obs
         r_gen[n]     = rgen_vol / dt_obs
         r_out[n]     = rout_vol / dt_obs
+
+        # pertes en m/pas obs
         sa_loss[n]   = sa_vol
         seep_loss[n] = seep_vol
 
@@ -240,8 +326,9 @@ def run_scs_hsm_cascade(dt_obs,
         "sa_loss": sa_loss, "seep_loss": seep_loss
     }
 
+
 # =========================================================
-# Objectif calage
+# Objectif calage (RMSE)
 # =========================================================
 def compute_rmse(q_obs, q_mod):
     q_obs = np.asarray(q_obs, float)
@@ -255,8 +342,7 @@ def compute_rmse(q_obs, q_mod):
 def _bounds_pm20pct(x):
     lo = 0.7 * float(x)
     hi = 1.3 * float(x)
-    lo = max(lo, 1e-30)
-    return lo, hi
+    return max(lo, 1e-30), hi
 
 def sample_uniform(bounds_log10):
     return np.array([np.random.uniform(lo, hi) for (lo, hi) in bounds_log10], float)
@@ -264,9 +350,11 @@ def sample_uniform(bounds_log10):
 def objective_rmse_theta_log10(theta_log10, data):
     """
     theta = [log10(k_infiltr), log10(k_runoff1), log10(k_runoff2), log10(k_seepage)]
+    RMSE sur Q_ruiss (L/h).
     """
     log10_ki, log10_kr1, log10_kr2, log10_ks = theta_log10
     b = data["bounds_log10"]
+
     if not (b[0][0] <= log10_ki  <= b[0][1]): return 1e9
     if not (b[1][0] <= log10_kr1 <= b[1][1]): return 1e9
     if not (b[2][0] <= log10_kr2 <= b[2][1]): return 1e9
@@ -296,6 +384,7 @@ def objective_rmse_theta_log10(theta_log10, data):
 
     q_mod_m3s = np.asarray(res["r_out"], float) * data["A_BV_M2"]
     q_mod_lh  = m3s_to_lh(q_mod_m3s)
+
     q_obs_lh  = data["qruiss_obs_lh"]
     return compute_rmse(q_obs_lh, q_mod_lh)
 
@@ -303,9 +392,11 @@ def calibrate_multistart_powell(data, bounds_log10, n_starts=20):
     best_x, best_J = None, np.inf
     for i in range(n_starts):
         x0 = sample_uniform(bounds_log10)
-        res = minimize(objective_rmse_theta_log10, x0, args=(data,),
-                       method="Powell", bounds=bounds_log10,
-                       options={"maxiter": 300, "disp": False})
+        res = minimize(
+            objective_rmse_theta_log10, x0, args=(data,),
+            method="Powell", bounds=bounds_log10,
+            options={"maxiter": 300, "disp": False}
+        )
         J = float(res.fun) if np.isfinite(res.fun) else 1e9
         print(f"Essai {i+1}/{n_starts} : RMSE = {J:.6e}")
         if J < best_J:
@@ -313,28 +404,27 @@ def calibrate_multistart_powell(data, bounds_log10, n_starts=20):
             best_x = np.array(res.x, float)
     return best_x, best_J
 
-# =========================================================
-# Bilan de masse adapté CASCADE
-# =========================================================
-def compute_mass_balance_B(res: dict,
-                           p_rate: np.ndarray,
-                           etp_rate: np.ndarray,
-                           dt_obs: float,
-                           i_a: float,
-                           s: float,
-                           h_a0: float = 0.0,
-                           h_s0: float = 0.0,
-                           h_r10: float = 0.0,
-                           h_r20: float = 0.0) -> dict:
-    """
-    Bilan de masse au pas obs (dt_obs) pour la version CASCADE.
 
+# =========================================================
+# Bilan de masse CASCADE
+# =========================================================
+def compute_mass_balance_cascade(
+    res: dict,
+    p_rate: np.ndarray,
+    etp_rate: np.ndarray,
+    dt_obs: float,
+    h_a0: float = 0.0,
+    h_s0: float = 0.0,
+    h_r10: float = 0.0,
+    h_r20: float = 0.0,
+) -> dict:
+    """
     Convention :
       - p_rate, etp_rate : m/s
-      - res["r_out"]     : m/s (sortie vers exutoire, sortie du réservoir 2)
-      - res["seep_loss"] : m par pas obs (volume surfacique)
-      - res["sa_loss"]   : m par pas obs (ET sur Ia)
-      - Etats : res["h_a"], res["h_s"], res["h_r1"], res["h_r2"] en m
+      - res["r_out"]     : m/s (sortie vers exutoire, sortie du r2)
+      - res["seep_loss"] : m par pas obs
+      - res["sa_loss"]   : m par pas obs
+      - états en m
     """
     p_rate   = np.nan_to_num(np.asarray(p_rate, float), nan=0.0)
     etp_rate = np.nan_to_num(np.asarray(etp_rate, float), nan=0.0)
@@ -381,25 +471,6 @@ def print_mass_balance(mb: dict):
     print(f"Erreur fermeture     = {mb['Closure_error_mm']:.6f} mm ({mb['Relative_error_%']:.6f} %)")
 
 
-def k_from_tau(tau_hours):
-  
-    tau_seconds = tau_hours * 3600.0
-    return np.log(2.0) / tau_seconds
-
-def infil_mm_h_to_m_s(v_mm_h):
-  
-    return v_mm_h * 1e-3 / 3600.0
-
-def tau_from_k_seconds(k):
-    if k <= 0:
-        return np.inf
-
-    tau_s = 1.0 / k     
-    tau_min = tau_s / 60
-    tau_h = tau_s / 3600
-
-    return tau_s, tau_min, tau_h
-
 # =========================================================
 # MAIN
 # =========================================================
@@ -407,7 +478,7 @@ def main():
     base_dir = Path(__file__).resolve().parent
 
     # ---- event à tester
-    csv_event_rel = "all_events1/2024/event_2024_014.csv"
+    csv_event_rel = "all_events1/2024/event_2024_004.csv"
     event_name = Path(csv_event_rel).stem
 
     # ---- surface parking
@@ -418,9 +489,9 @@ def main():
     S_FIXED   = 0.13    # m
 
     # ---- init (centres)
-    k_runoff1_init  = 1.7e-3   # s^-1
-    k_runoff2_init  = 1.7e-3   # s^-1 
-    k_seepage_init  = 6.5e-05  # s^-1
+    k_runoff1_init  = 1.7e-3
+    k_runoff2_init  = 1.7e-3
+    k_seepage_init  = 6.5e-05
 
     print("=== PARAMÈTRES INIT (centres) ===")
     print(f"A_BV_M2      = {A_BV_M2:.1f} m²")
@@ -431,28 +502,28 @@ def main():
 
     # ---- lecture event
     time_index, P_mm_event, qinf_obs_lh, qruiss_obs_lh, dt_obs = read_parking_event_csv(csv_event_rel)
-    p_rate = mm_per_step_to_mps(P_mm_event, dt_obs)  # m/s
+    p_rate = mm_per_step_to_mps(P_mm_event, dt_obs)
 
     # ---- ETP (Ia uniquement)
-    ETP_MM_PER_DAY = 5
+    ETP_MM_PER_DAY = 5.0
     etp_rate = build_constant_daytime_etp_rate(time_index, etp_mm_per_day=ETP_MM_PER_DAY, start_hour=8, end_hour=20)
-    print(f"[INFO] ETP constante = {ETP_MM_PER_DAY:.2f} mm/j entre 8h et 20h (0 sinon)")
+    print(f"[INFO] ETP synthétique = {ETP_MM_PER_DAY:.2f} mm/j entre 8h et 20h (0 sinon)")
 
     # ---- substepping
     DT_INTERNAL = 15.0
     print(f"[INFO] dt obs = {dt_obs:.1f} s | dt interne = {DT_INTERNAL:.1f} s")
 
-    # ---- option : infiltration peut-elle pomper h_r1 ?
-    INFIL_FROM_SURFACE = False  # mettre False si on veux mécaniquement plus de ruissellement
+    # ---- option : infiltration peut pomper h_r1 ?
+    INFIL_FROM_SURFACE = False
 
     # ---- bornes k_infiltr en mm/h (calage)
-    KINF_MIN_MM_H = 0.1
-    KINF_MAX_MM_H = 0.5
+    KINF_MIN_MM_H = 0.03
+    KINF_MAX_MM_H = 6
     ki_lo = infil_mm_h_to_m_s(KINF_MIN_MM_H)
     ki_hi = infil_mm_h_to_m_s(KINF_MAX_MM_H)
 
     # ---- calage
-    DO_CALIBRATION = False
+    DO_CALIBRATION = True
     N_STARTS = 15
 
     if DO_CALIBRATION:
@@ -467,12 +538,12 @@ def main():
             (math.log10(ks_lo),  math.log10(ks_hi)),
         ]
 
-        print("=== Bornes calibration (±20%) ===")
+        print("=== Bornes calibration ===")
         print(f"k_infiltr  ∈ [{ki_lo:.3e}, {ki_hi:.3e}] m/s   ({KINF_MIN_MM_H:.2f}–{KINF_MAX_MM_H:.2f} mm/h)")
         print(f"k_runoff1  ∈ [{kr1_lo:.3e}, {kr1_hi:.3e}] s^-1")
         print(f"k_runoff2  ∈ [{kr2_lo:.3e}, {kr2_hi:.3e}] s^-1")
         print(f"k_seepage  ∈ [{ks_lo:.3e}, {ks_hi:.3e}] s^-1")
-        print("=================================\n")
+        print("==========================\n")
 
         data = dict(
             dt_obs=dt_obs,
@@ -503,8 +574,9 @@ def main():
         print(f"k_runoff2    = {k_runoff2:.6e} s^-1  (t1/2 ≈ {math.log(2)/k_runoff2/60:.3f} min)")
         print(f"k_seepage    = {k_seepage:.6e} s^-1  (t1/2 ≈ {math.log(2)/k_seepage/3600:.3f} h)")
         print("==============================\n")
+
     else:
-        # valeurs fallback
+        # fallback (comme ton script)
         k_infiltr = 2.747694e-07
         k_runoff1 = k_runoff1_init
         k_runoff2 = k_runoff2_init
@@ -522,46 +594,48 @@ def main():
         k_seepage=k_seepage,
         k_runoff1=k_runoff1,
         k_runoff2=k_runoff2,
-        infil_from_surface=INFIL_FROM_SURFACE
+        infil_from_surface=INFIL_FROM_SURFACE,
     )
 
     # ---- bilan de masse
-    mb = compute_mass_balance_B(
+    mb = compute_mass_balance_cascade(
         res=res,
         p_rate=p_rate,
         etp_rate=etp_rate,
         dt_obs=dt_obs,
-        i_a=I_A_FIXED,
-        s=S_FIXED,
         h_a0=0.0, h_s0=0.0, h_r10=0.0, h_r20=0.0
     )
     print_mass_balance(mb)
 
     # =========================================================
-    # Conversions débits (L/h) + volumes cumulés (m³)
+    # Conversions débits + volumes cumulés (m³)
     # =========================================================
+    qruiss_obs_lh = np.asarray(qruiss_obs_lh, float)
     qruiss_obs_m3s = lh_to_m3s(qruiss_obs_lh)
+
     qruiss_mod_m3s = np.asarray(res["r_out"], float) * A_BV_M2
     qruiss_mod_lh  = m3s_to_lh(qruiss_mod_m3s)
 
+    # Proxy débit "inf/drain" mod : seep_loss (m/pas) -> m/s -> m3/s -> L/h
     qinf_mod_m3s = (np.asarray(res["seep_loss"], float) / dt_obs) * A_BV_M2
     qinf_mod_lh  = m3s_to_lh(qinf_mod_m3s)
+
+    qinf_obs_lh = None if qinf_obs_lh is None else np.asarray(qinf_obs_lh, float)
 
     V_obs_cum = np.cumsum(np.clip(qruiss_obs_m3s, 0.0, None) * dt_obs)
     V_mod_cum = np.cumsum(np.clip(qruiss_mod_m3s, 0.0, None) * dt_obs)
 
-    print("\n===== BILAN VOLUMES (RUISSELLEMENT) SUR LA PÉRIODE =====")
+    print("\n===== BILAN VOLUMES (RUISSELLEMENT) =====")
     print(f"Volume observé V_obs     = {V_obs_cum[-1]:.6f} m³")
     print(f"Volume modélisé V_mod    = {V_mod_cum[-1]:.6f} m³")
     if V_obs_cum[-1] > 0:
         print(f"Rapport V_mod / V_obs    = {V_mod_cum[-1] / V_obs_cum[-1]:.3f}")
-    print("=========================================================\n")
+    print("=========================================\n")
 
     # =========================================================
     # Séries mm/pas + cumuls
     # =========================================================
     factor_mm = dt_obs * 1000.0
-
     P_mm      = p_rate * factor_mm
     infil_mm  = np.asarray(res["infil"], float) * factor_mm
     runoff_mm = np.asarray(res["r_out"], float) * factor_mm
@@ -616,10 +690,11 @@ def main():
     fig.savefig(plots_dir / "Qruiss_obs_vs_mod_LH_P.png", dpi=200)
     plt.close(fig)
 
-    # FIG 2: Q_inf + pluie
+    # FIG 2: Q_inf (si dispo) + proxy mod (seep)
     fig, axD = plt.subplots(figsize=(10, 4))
-    axD.plot(time_index, qinf_obs_lh, label="Q_inf_obs (L/h)", linewidth=1.0, alpha=0.7)
-    axD.plot(time_index, qinf_mod_lh, label="Q_inf_mod (L/h)", linewidth=1.2)
+    if qinf_obs_lh is not None:
+        axD.plot(time_index, qinf_obs_lh, label="Q_inf_obs (L/h)", linewidth=1.0, alpha=0.7)
+    axD.plot(time_index, qinf_mod_lh, label="Q_inf_mod proxy (seep) (L/h)", linewidth=1.2)
     axD.set_xlabel("Date")
     axD.set_ylabel("Débit drain (L/h)")
     axD.grid(True, linewidth=0.4, alpha=0.6)
@@ -637,12 +712,12 @@ def main():
     fig.savefig(plots_dir / "Qinf_obs_vs_mod_LH_P.png", dpi=200)
     plt.close(fig)
 
-    # FIG 3: états (Ia, sol, r1, r2)
+    # FIG 3: états
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(time_index, np.asarray(res["h_a"],  float)[:-1], label="h_a (Ia)")
     ax.plot(time_index, np.asarray(res["h_s"],  float)[:-1], label="h_s (sol)")
-    ax.plot(time_index, np.asarray(res["h_r1"], float)[:-1], label="h_r1 (surface 1)")
-    ax.plot(time_index, np.asarray(res["h_r2"], float)[:-1], label="h_r2 (surface 2)")
+    ax.plot(time_index, np.asarray(res["h_r1"], float)[:-1], label="h_r1")
+    ax.plot(time_index, np.asarray(res["h_r2"], float)[:-1], label="h_r2")
     ax.set_xlabel("Date")
     ax.set_ylabel("Hauteur (m)")
     ax.grid(True, linewidth=0.4, alpha=0.6)
