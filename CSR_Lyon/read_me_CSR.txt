@@ -1,11 +1,8 @@
 # Modélisation Hydrologique Continue - Site CSR Lyon
-## Guide d'Utilisation
-
----
 
 ## Vue d'Ensemble
 
-Ce projet développe une chaîne de modélisation hydrologique continue pour le site CSR Lyon (OTHU), dans le cadre du projet de fin d'étude "Interprétation et développement du modèle SCS pour la modélisation de séries chronologiques continues" (Antoine Sognos, 2025-2026).
+Ce projet développe une chaîne de modélisation hydrologique continue pour le site CSR Lyon (OTHU), dans le cadre du projet de fin d'étude "Interprétation et développement du modèle SCS pour la modélisation de séries chronologiques continues" 
 
 ### Composantes du Projet
 
@@ -15,9 +12,9 @@ Ce projet développe une chaîne de modélisation hydrologique continue pour le 
 - Analyse des vitesses d'infiltration
 
   Modélisation   :
-- Modèle A : SCS sans routage
-- Modèle B : SCS avec routage rapide
-- Modèle D : SCS avec cascade de routage (spécifique CSR)
+- Modèle A : SCS continu sans routage
+- Modèle B : SCS continu avec routage rapide
+- Modèle D : SCS continu avec cascade de routage (spécifique CSR)
 
   Simulation et analyse   :
 - Simulation annuelle continue avec validation croisée temporelle
@@ -33,14 +30,11 @@ Ce projet développe une chaîne de modélisation hydrologique continue pour le 
 
 ## Architecture du Projet
 
-### Structure des Dossiers
-
-   
 CSR_Lyon/
 ├── 01_Code/
 │   ├── modele_A.py                              # SCS sans routage
 │   ├── modele_B.py                              # SCS + routage rapide
-│   ├── modele_D.py                              # SCS + cascade (CSR spécifique)
+│   ├── modele_D.py                              # SCS + cascade 
 │   │
 │   ├── decoupe_event_plot_cumul_vs_pluie.py    # Découpage événementiel
 │   ├── analyse_infiltration_velocity_from_events.py
@@ -65,8 +59,6 @@ CSR_Lyon/
     ├── Etude_hydrologique/
     └── Identification constantes vidange CSR/
    
-
----
 
 ## PARTIE 1 : PRÉ-TRAITEMENT DES DONNÉES
 
