@@ -4,7 +4,7 @@ SCS-HSM continu avec réservoir de ruissellement vers l'exutoire
 + réservoir souterrain à vidange lente
 ---------------------------------------------------------------
 
-- Structure des réservoirs comme chez Guinot :
+- Structure des réservoirs :
     * h_a   : réservoir d'abstraction Ia
     * h_s   : réservoir de sol
     * h_r   : réservoir de surface (stock de ruissellement rapide)
@@ -25,8 +25,6 @@ SCS-HSM continu avec réservoir de ruissellement vers l'exutoire
     * Une fraction alpha_sub de l'infiltration alimente le réservoir lent h_sub.
     * Le réservoir h_sub se vide vers l'exutoire selon :
             q_sub = k_sub * h_sub
-      (limité pour ne pas sortir plus que le stock disponible).
-
       => Q_mod_total = (r_out + q_sub) * A_BV_M2
 
 - Paramètres à caler (i_a FIXE, s FIXE) :
@@ -74,28 +72,6 @@ def run_scs_hsm(
     h_sub_init: float = 0.0,
     alpha_sub: float = 0.7,  # fraction de l'infiltration envoyée vers le réservoir lent h_sub
 ) -> dict:
-    """
-    Modèle SCS-HSM continu avec :
-      - réservoir de surface h_r (ruissellement rapide),
-      - réservoir lent h_sub (écoulement subsurfacique d'évènement),
-      - réservoir de sol h_s qui ne contribue qu'au profond.
-
-    CHEMIN DE L'EAU :
-      1) P -> q_n (pluie nette après Ia)
-      2) q_n -> infiltration totale infil_n (loi HSM limitée par l'eau de surface)
-      3) Décomposition de l'infiltration :
-            - alpha_sub * infil_n -> réservoir lent h_sub
-            - (1 - alpha_sub) * infil_n -> réservoir de sol h_s
-      4) h_s se vide uniquement vers le profond via k_seepage (pas de retour à l'exutoire)
-      5) h_sub se vide vers l'exutoire via k_sub :
-            q_sub = k_sub * h_sub (limité pour ne pas dépasser le stock)
-      6) A la surface :
-            r_gen = max(q_n - infil_from_rain, 0.0)
-            h_r reçoit r_gen et se vide vers l'exutoire :
-                r_out = k_runoff * h_r (limité par le stock dispo + r_gen)
-      7) Débit total vers exutoire :
-            Q_mod = (r_out + q_sub) * A_BV   (A_BV géré en dehors)
-    """
 
     # clamp alpha_sub dans [0, 1]
     alpha_sub = max(0.0, min(alpha_sub, 1.0))
@@ -156,7 +132,7 @@ def run_scs_hsm(
         # ----------------------------------------------------------
         # 2) Réservoir Ia -> pluie nette q_n
         # ----------------------------------------------------------
-        h_a_temp = h_a_after_etp + p * dt   # h_a après ajout de P (avant débordement)
+        h_a_temp = h_a_after_etp + p * dt   # h_a après ajout de P 
         if h_a_temp < i_a:
             q_n = 0.0
             h_a_next = h_a_temp
@@ -190,7 +166,7 @@ def run_scs_hsm(
         if water_avail_rate < 0.0:
             water_avail_rate = 0.0
 
-        # infiltration totale (limitée par dispo et potentiel HSM)
+        # infiltration totale (limitée par dispo et potentiel)
         infil_n = max(0.0, min(infil_pot, water_avail_rate))
 
         # part d'infiltration venant de la pluie nette
@@ -527,7 +503,7 @@ def objective(theta: np.ndarray, data: dict) -> float:
     etp_rate  = data["etp_rate"]
     q_obs     = data["q_obs_m3s"]
 
-    # --- Garde-fous basés sur les bornes physiques définies en haut ---
+    # --- Garde-fous basés sur les bornes physiques définies plus haut ---
     if not (LOG10_KINF_MIN  < log10_k_infiltr < LOG10_KINF_MAX):
         return 1e6
 
@@ -676,7 +652,7 @@ def infil_bounds_mm_h_to_log10k(v_min_mm_h: float, v_max_mm_h: float) -> tuple[f
 # bis. Définition physique des bornes de calibration
 # ======================================================================
 
-# 1) Infiltration : capacité en mm/h 
+# 1) Infiltration : vitesse d'infiltration en mm/h 
 INFIL_MIN_MM_H = 20.0    
 INFIL_MAX_MM_H = 200.0   
 LOG10_KINF_MIN, LOG10_KINF_MAX = infil_bounds_mm_h_to_log10k(
@@ -700,7 +676,7 @@ LOG10_KSUB_MIN, LOG10_KSUB_MAX = half_life_bounds_to_log10k(
 
 # 4) Seepage profond (k_seepage) : demi-vie en heures
 #    Encore plus lent, typiquement plusieurs jours / semaines.
-T_HALF_SEEP_MIN_H = 24
+T_HALF_SEEP_MIN_H = 18
 T_HALF_SEEP_MAX_H = 64   
 LOG10_KSEEP_MIN, LOG10_KSEEP_MAX = half_life_bounds_to_log10k(
     T_HALF_SEEP_MIN_H, T_HALF_SEEP_MAX_H
@@ -708,44 +684,13 @@ LOG10_KSEEP_MIN, LOG10_KSEEP_MAX = half_life_bounds_to_log10k(
 
 
 def k_from_tau(tau_hours):
-    """
-    Convertit un temps de demi-vidange (tau, en heures) 
-    en coefficient de vidange k (en s^-1).
-
-    Paramètres
-    ----------
-    tau_hours : float
-        Temps de demi-vidange en heures.
-
-    Retour
-    ------
-    k : float
-        Coefficient de vidange en s^-1.
-    """
     tau_seconds = tau_hours * 3600.0
     return np.log(2.0) / tau_seconds
 
 def infil_mm_h_to_m_s(v_mm_h):
-    """
-    Convertit une vitesse d'infiltration en mm/h vers m/s.
-
-    Paramètres
-    ----------
-    v_mm_h : float
-        Vitesse en mm/h.
-
-    Retour
-    ------
-    v_m_s : float
-        Vitesse en m/s.
-    """
     return v_mm_h * 1e-3 / 3600.0
 
 def tau_from_k_seconds(k):
-    """
-    k : coefficient de vidange en s^-1
-    Retourne tau en secondes, minutes, heures
-    """
     if k <= 0:
         return np.inf
 

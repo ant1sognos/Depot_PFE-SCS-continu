@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 SCS-HSM continu avec réservoir de ruissellement vers l'exutoire
-AVEC ROUTAGE (sans réservoir lent)
+AVEC ROUTAGE 
 ---------------------------------------------------------------
 
-- Structure des réservoirs comme chez Guinot :
+- Structure des réservoirs :
     * h_a : réservoir d'abstraction Ia
     * h_s : réservoir de sol
-    * h_r : réservoir de surface (stock de ruissellement)
+    * h_r : réservoir de surface 
 
-- Nouveauté :
     * Une fraction de h_r est évacuée vers l'exutoire à chaque pas de temps
       selon une loi de réservoir linéaire :
             r_out = k_runoff * h_r
-      => Q_mod = r_out * A_BV_M2   (m³/s)
+      => Q_mod = r_out * A_BV_M2   (m3/s)
 
     * On limite r_out pour ne pas vider plus d'eau que ce qui est disponible :
             r_out <= (h_r/dt + r_gen)
@@ -40,7 +39,7 @@ from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
-# Un peu d'optimisation pour l'affichage
+
 mpl.rcParams["path.simplify"] = True
 mpl.rcParams["path.simplify_threshold"] = 1.0
 mpl.rcParams["agg.path.chunksize"] = 10000
@@ -141,7 +140,7 @@ def run_scs_hsm(
         # ----------------------------------------------------------
         # 2) Réservoir Ia -> pluie nette q_n
         # ----------------------------------------------------------
-        h_a_temp = h_a_after_etp + p * dt   # h_a après ajout de P (avant débordement)
+        h_a_temp = h_a_after_etp + p * dt   # h_a après ajout de P 
         if h_a_temp < i_a:
             q_n = 0.0
             h_a_next = h_a_temp
@@ -402,7 +401,7 @@ def read_etp_series_for_time_index(
 
 
 # ======================================================================
-# 4. Fonctions de calage (critères)
+# 4. Fonctions de calage 
 # ======================================================================
 
 def compute_rmse(q_obs: np.ndarray, q_mod: np.ndarray) -> float:
@@ -418,14 +417,7 @@ def compute_rmse(q_obs: np.ndarray, q_mod: np.ndarray) -> float:
     return float(rmse)
 
 def compute_log_rmse(q_obs: np.ndarray, q_mod: np.ndarray, eps: float = 1e-9) -> float:
-    """
-    RMSE entre log(q_obs) et log(q_mod).
 
-    - On ne filtre que sur q_obs > 0 (là où il y a du débit observé),
-      et sur les valeurs finies.
-    - On ajoute eps dans le log pour éviter log(0),
-      et on clip q_mod pour ne pas descendre sous eps.
-    """
     q_obs = np.asarray(q_obs, dtype=float)
     q_mod = np.asarray(q_mod, dtype=float)
 
@@ -451,7 +443,7 @@ def compute_log_rmse(q_obs: np.ndarray, q_mod: np.ndarray, eps: float = 1e-9) ->
 
 def compute_nash(q_obs: np.ndarray, q_mod: np.ndarray, eps: float = 1e-9) -> float:
     """
-    Nash-Sutcliffe Efficiency (NSE) entre Q_obs et Q_mod.
+    NSE entre Q_obs et Q_mod.
     """
     q_obs = np.asarray(q_obs, dtype=float)
     q_mod = np.asarray(q_mod, dtype=float)
@@ -580,7 +572,7 @@ def objective(theta: np.ndarray, data: dict) -> float:
             h_r_init=0.0,
         )
     except Exception:
-        # Le modèle diverge ou plante → grosse pénalité
+        # Le modèle diverge ou plante -> grosse pénalité
         return 1e6
 
     # Débit modélisé vers l'exutoire [m³/s]
@@ -655,37 +647,11 @@ def print_mass_balance(mb: dict):
     )
     
 def k_from_tau(tau_hours):
-    """
-    Convertit un temps de demi-vidange (tau, en heures) 
-    en coefficient de vidange k (en s^-1).
 
-    Paramètres
-    ----------
-    tau_hours : float
-        Temps de demi-vidange en heures.
-
-    Retour
-    ------
-    k : float
-        Coefficient de vidange en s^-1.
-    """
     tau_seconds = tau_hours * 3600.0
     return np.log(2.0) / tau_seconds
 
 def infil_mm_h_to_m_s(v_mm_h):
-    """
-    Convertit une vitesse d'infiltration en mm/h vers m/s.
-
-    Paramètres
-    ----------
-    v_mm_h : float
-        Vitesse en mm/h.
-
-    Retour
-    ------
-    v_m_s : float
-        Vitesse en m/s.
-    """
     return v_mm_h * 1e-3 / 3600.0
 
 

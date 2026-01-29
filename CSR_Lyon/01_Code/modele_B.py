@@ -5,31 +5,27 @@ APPLIQUÉ AU PARKING CSR (calage évènementiel)
 ---------------------------------------------------------------
 
 Objectif :
-    - Lire un CSV d'évènement CSR (format canonique)
+    - Lire un CSV d'évènement CSR 
     - Caler (multistart + Powell) :
           k_infiltr  (m/s)  : capacité d'infiltration
           k_seepage  (s^-1) : vidange/percolation du sol
           k_runoff   (s^-1) : vidange du stock de surface vers l'exutoire
     - Simuler Q_mod et produire bilans + figures
 
-Modèle (Guinot + routage simple du stock de surface) :
+Modèle A + routage simple du stock de surface :
     - h_a : réservoir d'abstraction Ia
     - h_s : réservoir de sol (capacité S)
     - h_r : stock de surface
     - r_gen = max(q - infil_from_rain, 0) : ruissellement généré par la pluie nette
     - r_out = k_runoff * h_r (borné)      : ruissellement sortant vers exutoire
-    - Q_mod = r_out * A_BV_M2             : débit modélisé à l'exutoire (m³/s)
+    - Q_mod = r_out * A_BV_M2             : débit modélisé à l'exutoire (m3/s)
 
-Entrées (format CSR canonique) :
+Entrées :
     - Date                : datetime
     - Hauteur_de_pluie_mm : pluie (mm / pas)
     - Q_inf_LH            : débit infiltré (L/h) [optionnel, non calé ici]
     - Q_ruiss_LH          : débit ruisselé (L/h) -> utilisé comme Q_obs
 
-Tolérance (anciens exports) :
-    - date / dateP peuvent remplacer Date
-    - P_mm peut remplacer Hauteur_de_pluie_mm
-    - Q_ls (L/s) peut remplacer Q_ruiss_LH (L/h)
 
 Sorties :
     - Figures dans ../03_Plots/Parking_CSR_Avec_routage/<event_name>/
@@ -114,15 +110,7 @@ def run_scs_hsm(
     h_s_init: float = 0.0,
     h_r_init: float = 0.0,
 ) -> dict:
-    """
-    SCS-HSM (Guinot) + routage du stock de surface h_r vers l'exutoire :
-        r_out = k_runoff * h_r   (borné pour ne pas vider au-delà de l'eau dispo)
-
-    Sortie :
-        - h_a, h_s, h_r (nt+1)
-        - q, infil, r_gen, r_out, sa_loss, seep_loss (nt)
-        - mass_balance
-    """
+  
     p_rate = np.nan_to_num(np.asarray(p_rate, dtype=float), nan=0.0)
     nt = len(p_rate)
 

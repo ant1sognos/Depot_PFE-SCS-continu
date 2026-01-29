@@ -1,24 +1,40 @@
 
 """
-SCS–HSM CONTINU — VERSION PURE GUINOT (sans routage)
-----------------------------------------------------
+SCS–HSM CONTINU — version sans routage 
 
-Version strictement identique à ton gros script avec routage :
-- même structure
-- même calibration
-- mêmes fonctions
-- mêmes bilans
-- mêmes figures
-- même routine de calcul
+Objectif
+- Simuler la production pluie–ruissellement à pas de temps constant (dt) avec la formulation SCS–HSM.
 
-SAUF :
-- aucune loi de routage
-- aucun paramètre k_runoff
-- aucun r_out
-- ruissellement = r_gen = max(q - infiltration, 0)
-- Q_mod = r_gen * A_BV
+Structure des réservoirs
+- h_a : réservoir d’abstraction initiale (Ia)
+- h_s : réservoir de sol (capacité S) pilotant l’infiltration HSM
+- h_r : stock de surface (diagnostic uniquement, non routé vers l’exutoire)
 
+Principe hydraulique (sans propagation)
+- Pluie brute p → gestion de Ia → pluie nette q
+- Infiltration potentielle HSM contrôlée par (h_s, S) puis limitée par l’eau disponible en surface
+- Percolation profonde depuis le sol : seepage ~ exp(-k_seepage·dt)
+- Ruissellement généré : r_gen = max(q − infiltration, 0)
+- Débit modélisé à l’exutoire (hypothèse instantanée) :
+      Q_mod = r_gen * A_BV     (conversion effectuée dans main)
+
+Données d’entrée
+- CSV évènement (../02_Data/…) : dateP ; P_mm ; (option) Q_ls
+- ETP SAFRAN journalière (../02_Data/ETP_SAFRAN_J.csv) projetée sur la grille temporelle
+
+Calage (optionnel)
+- Optimisation multistart + Powell sur :
+      theta = [i_a, s, log10(k_infiltr), log10(k_seepage)]
+- Critère : combinaison niveau (RMSE), forme (RMSE sur hydrogrammes normalisés) et volume (erreur relative)
+
+Sorties
+- Impression du bilan volumique + bilan de masse (fermeture P = ET + seepage + Δstocks)
+- Figures sauvegardées dans ../03_Plots/Sans Routage/ :
+    1) Q_mod vs Q_obs + pluie inversée
+    2) États des réservoirs (h_a, h_s, h_r)
+    3) Cumuls P / ETP / infiltration / percolation / ruissellement généré
 """
+
 
 from pathlib import Path
 import numpy as np
@@ -35,7 +51,7 @@ mpl.rcParams["path.simplify_threshold"] = 1.0
 
 
 # ======================================================================
-# 1. MODELE SCS-HSM — VERSION GUINOT SANS ROUTAGE
+# 1. MODELE SCS-HSM 
 # ======================================================================
 
 def run_scs_hsm(
@@ -50,15 +66,6 @@ def run_scs_hsm(
     h_s_init=0.0,
     h_r_init=0.0,
 ):
-    """
-    Implémentation 100% fidèle au modèle SCS-HSM de Guinot
-    mais sans routage du réservoir h_r.
-
-    Ruissellement généré :
-        r_gen = max(q - infiltration, 0)
-
-    Q_mod = r_gen * A_BV (fait dans main)
-    """
 
     p_rate = np.nan_to_num(p_rate.astype(float))
     etp_rate = np.nan_to_num(etp_rate.astype(float))
@@ -141,7 +148,7 @@ def run_scs_hsm(
     # BILAN DE MASSE — 
     # ---------------------------------------------------------
     # P_tot = ET_tot + Seep_tot + Δ(h_a + h_s + h_r)
-    # r_gen alimente h_r -> flux interne (diagnostic seulement)
+    # r_gen alimente h_r -> flux interne
     # =========================================================
     P_tot = np.sum(p_rate) * dt               # [m]
     ET_tot = np.sum(sa_loss)                  # [m]
@@ -156,7 +163,6 @@ def run_scs_hsm(
         (h_r[-1] - h_r[0])
     )
 
-    # <<< IMPORTANT : r_gen NE FIGURE PAS dans la fermeture >>>
     closure = P_tot - (ET_tot + Seep_tot + delta_storage)
 
     mass_balance = dict(
@@ -198,11 +204,10 @@ def read_rain_series(csv_name, dt):
     
     q_obs = None
     if "Q_ls" in df.columns:
-        # Conversion robuste en numérique + remplacement des NaN par 0
         q_obs = (
             pd.to_numeric(df["Q_ls"], errors="coerce")  # tout ce qui est non-numérique → NaN
-              .fillna(0.0)                              # les NaN → 0
-              .to_numpy() / 1000.0                      # l/s → m³/s
+              .fillna(0.0)                              # les NaN -> 0
+              .to_numpy() / 1000.0                      # l/s -> m3/s
         )
 
 
@@ -249,9 +254,9 @@ def compute_composite_loss(
     A_BV,
     qref_percentile=85.0,
     qevent_percentile=85.0,
-    alpha_events=30.0,   # augmente
-    beta_runoff=20.0,    # réduit fortement
-    gamma_smooth=10.0,   # NOUVEAU : poids du lissage
+    alpha_events=30.0,   
+    beta_runoff=20.0,    
+    gamma_smooth=10.0,   
 ):
     q_obs = np.asarray(q_obs)
     q_mod = np.asarray(q_mod)
@@ -284,7 +289,6 @@ def compute_composite_loss(
     else:
         pen_runoff = 1e3
 
-    # 4) TERME DE LISSAGE (empêche les pulses absurdes)
     dq = np.diff(q_mod)
     # Option : ou diff seconde
     # dq2 = np.diff(q_mod,2)
@@ -327,11 +331,11 @@ def objective(theta, data):
         k_seepage=k_seepage,
     )
 
-    # Ruissellement généré (m/s) -> Q_mod (m³/s)
+    # Ruissellement généré (m/s) -> Q_mod (m3/s)
     r_gen = res["r_gen"]
     q_mod = r_gen * data["A"]          # A = aire du BV en m²
 
-    q_obs = np.asarray(data["q_obs"], dtype=float)   # m³/s
+    q_obs = np.asarray(data["q_obs"], dtype=float)   # m3/s
     dt     = data["dt"]
 
     # Masque des valeurs valides
@@ -502,8 +506,8 @@ def main():
     V_mod = float(np.sum(q_mod) * dt)
 
     print("\n===== BILAN VOLUMES =====")
-    print(f"V_obs = {V_obs:.1f} m³")
-    print(f"V_mod = {V_mod:.1f} m³")
+    print(f"V_obs = {V_obs:.1f} m3")
+    print(f"V_mod = {V_mod:.1f} m3")
     if V_obs > 0:
         print(f"Ratio V_mod/V_obs = {V_mod/V_obs:.3f}")
 
@@ -521,11 +525,11 @@ def main():
     # ============================================================
     fig, ax = plt.subplots(figsize=(12, 4))
 
-    ax.plot(time, q_obs, label="Q_obs (m³/s)", lw=1.0, alpha=0.7)
-    ax.plot(time, q_mod, label="Q_mod (m³/s)", lw=1.2)
+    ax.plot(time, q_obs, label="Q_obs (m3/s)", lw=1.0, alpha=0.7)
+    ax.plot(time, q_mod, label="Q_mod (m3/s)", lw=1.2)
 
     ax.set_xlabel("Date")
-    ax.set_ylabel("Débit (m³/s)")
+    ax.set_ylabel("Débit (m3/s)")
     ax.grid(alpha=0.6)
 
     ax2 = ax.twinx()

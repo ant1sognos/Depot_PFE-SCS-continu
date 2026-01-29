@@ -23,9 +23,9 @@ Modèle :
     - substepping dt_int : intégration interne plus fine
     - cascade r1->r2 : solution exacte du réservoir linéaire à entrée constante sur dt_int
 
-Calage (optionnel) :
+Calage :
     - theta = [log10(k_infiltr), log10(k_runoff1), log10(k_runoff2), log10(k_seepage)]
-    - critère : RMSE sur Q_ruiss (L/h) par défaut (comme ton script)
+    - critère : RMSE sur Q_ruiss (L/h) 
 
 Sorties :
     - Figures dans ../03_Plots/Parking_CSR_CASCADE/<event_name>/
@@ -65,7 +65,7 @@ def infil_mm_h_to_m_s(v_mm_h):
 
 
 # =========================================================
-# ETP synthétique (optionnel)
+# ETP synthétique 
 # =========================================================
 def build_constant_daytime_etp_rate(
     time_index: pd.DatetimeIndex,
@@ -90,7 +90,7 @@ def build_constant_daytime_etp_rate(
 
 
 # =========================================================
-# Lecture event CSV (CSR robuste)
+# Lecture event CSV
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parents[1]
 
@@ -328,8 +328,9 @@ def run_scs_hsm_cascade(
 
 
 # =========================================================
-# Objectif calage (RMSE)
+# Objectif calage
 # =========================================================
+
 def compute_rmse(q_obs, q_mod):
     q_obs = np.asarray(q_obs, float)
     q_mod = np.asarray(q_mod, float)
@@ -406,8 +407,9 @@ def calibrate_multistart_powell(data, bounds_log10, n_starts=20):
 
 
 # =========================================================
-# Bilan de masse CASCADE
+# Bilan de masse
 # =========================================================
+
 def compute_mass_balance_cascade(
     res: dict,
     p_rate: np.ndarray,

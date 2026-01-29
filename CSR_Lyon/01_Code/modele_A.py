@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-SCS-HSM continu — VERSION SANS ROUTAGE
-APPLIQUÉ AU PARKING CSR (calage évènementiel)
+SCS-HSM continu — 
+APPLIQUÉ AU PARKING CSR 
 -------------------------------------------------
 
 Objectif :
-    Pipeline AS(CSR avec routage) :
+    Pipeline :
       - lecture d'un CSV d'évènement
       - calage multistart + Powell sur k_infiltr et k_seepage
       - simulation Q_mod, bilans (volumes / masse)
       - figures + dossiers de sortie
 
-    Ici : SCS-HSM "Guinot pur" (sans routage) :
-      - PAS de paramètre k_runoff
-      - PAS de routage du réservoir h_r
+    Ici : SCS-HSM :
       - ruissellement à l'exutoire = r_gen = max(q - infiltration, 0)
       - Q_mod = r_gen * A_BV_M2
 
@@ -63,7 +61,7 @@ DO_CALIBRATION = True                                  # True = calage, False = 
 
 
 # ======================================================================
-# 1. Modèle SCS-HSM "Guinot pur" (sans routage, sans k_runoff)
+# 1. Modèle SCS-HSM 
 # ======================================================================
 
 def run_scs_hsm(
@@ -78,17 +76,7 @@ def run_scs_hsm(
     h_s_init: float = 0.0,
     h_r_init: float = 0.0,
 ) -> dict:
-    """
-    SCS-HSM "Guinot" SANS ROUTAGE :
-
-      ha : réservoir d'abstraction (Ia)
-      hs : réservoir de sol (capacité S)
-      hr : stock de surface (diagnostic)
-
-    Débit à l'exutoire (modélisé ensuite) :
-      r_gen = max(q - infil, 0)  [m/s]
-      Q_mod = r_gen * A_BV_M2    [m³/s]
-    """
+    
     p_rate = np.nan_to_num(np.asarray(p_rate, dtype=float), nan=0.0)
     nt = len(p_rate)
 
@@ -167,7 +155,7 @@ def run_scs_hsm(
         r_gen_n = max(q_n - infil_n, 0.0)  # [m/s]
         r_gen[n] = r_gen_n
 
-        # 7) Stock de surface (diagnostic)
+        # 7) Stock de surface 
         h_r_next = h_r[n] + (q_n - infil_n) * dt
         h_r[n + 1] = max(h_r_next, 0.0)
 
@@ -212,12 +200,7 @@ def run_scs_hsm(
 # 2. Lecture d'un CSV d'évènement parking (CSR + tolérance)
 # ======================================================================
 
-def _infer_dayfirst(date_series: pd.Series) -> bool:
-    """
-    Heuristique simple :
-      - si on voit beaucoup de formats type 31/12/2024 -> dayfirst=True
-      - si c'est ISO 2024-12-31 -> dayfirst=False
-    """
+def _infer_dayfirst(date_series: pd.Series) -> bool: 
     s = date_series.astype(str).dropna().head(20).tolist()
     if not s:
         return False
@@ -301,7 +284,7 @@ def read_parking_event_csv(csv_rel_path: str):
 
 
 # ======================================================================
-# 3. Critères (RMSE, log-RMSE, Nash)
+# 3. Critères 
 # ======================================================================
 
 def compute_rmse(q_obs: np.ndarray, q_mod: np.ndarray) -> float:
@@ -342,7 +325,7 @@ def compute_nash(q_obs: np.ndarray, q_mod: np.ndarray, eps: float = 1e-9) -> flo
 
 
 # ======================================================================
-# 4. Bornes physiques (sans k_runoff)
+# 4. Bornes physiques
 # ======================================================================
 
 def half_life_bounds_to_log10k(t_half_min_h: float, t_half_max_h: float) -> tuple[float, float]:
